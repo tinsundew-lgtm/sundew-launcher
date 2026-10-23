@@ -16,6 +16,20 @@ pub struct Instance {
     pub version_name: Option<String>,
     pub modpack_slug: Option<String>,
     pub created: String,
+
+    /// --- Каркас под индивидуальные настройки сборки (задел на будущее, Пункт 4) ---
+    /// Выделенная память (МБ). `None` = используется глобальный `LauncherState.ram_mb`.
+    #[serde(default)]
+    pub memory_mb: Option<u64>,
+    /// Кастомные JVM-аргументы для этой сборки.
+    #[serde(default)]
+    pub jvm_args: Option<String>,
+    /// Свой путь к Java для этой сборки (иначе глобальный из LauncherState).
+    #[serde(default)]
+    pub java_path: Option<String>,
+    /// Путь/идентификатор иконки сборки (заготовка; рендер позже).
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -35,8 +49,13 @@ pub fn state_path(root: &Path) -> PathBuf {
 }
 
 pub fn default_dir() -> PathBuf {
+    // Пользовательская директория данных (Windows: %APPDATA%,
+    // macOS: ~/Library/Application Support, Linux: ~/.local/share).
+    // Никогда не пишем рядом с .exe — это устраняет PermissionDenied
+    // в защищённых папках в стиле "Program Files".
     dirs::data_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .join("LimeCraft")
 }
 

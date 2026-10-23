@@ -139,7 +139,8 @@ pub fn get_versions_post(client: &reqwest::blocking::Client, ids: &[String]) -> 
 
 /// Download the raw .mrpack file into `dest`.
 pub fn download_mrpack(client: &reqwest::blocking::Client, url: &str, dest: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dest.parent().unwrap()).map_err(|e| e.to_string())?;
+    let parent = dest.parent().ok_or_else(|| format!("dest {} has no parent dir", dest.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
     download::download_file(client, url, dest, None)
 }
 
@@ -167,12 +168,12 @@ pub fn extract_mrpack(mrpack: &Path, target: &Path) -> Result<ModrinthIndex, Str
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("not a valid zip: {e}"))?;
     let mut index: Option<ModrinthIndex> = None;
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).unwrap();
+        let mut entry = archive.by_index(i).map_err(|e| format!("read zip entry #{i}: {e}"))?;
         let name = entry.name().to_string();
         if name == "modrinth.index.json" {
             let mut content = String::new();
             use std::io::Read;
-            entry.read_to_string(&mut content).map_err(|e| e.to_string())?;
+            entry.read_to_string(&mut content).map_err(|e| format!("read modrinth.index.json: {e}"))?;
             index = Some(serde_json::from_str(&content).map_err(|e| format!("index.json parse: {e}"))?);
             break;
         }
@@ -181,23 +182,29 @@ pub fn extract_mrpack(mrpack: &Path, target: &Path) -> Result<ModrinthIndex, Str
     drop(archive);
 
     // extract every file from the zip, keeping relative names
-    let file = std::fs::File::open(mrpack).map_err(|e| e.to_string())?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    let file = std::fs::File::open(mrpack).map_err(|e| format!("reopen mrpack: {e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("reopen mrpack: {e}"))?;
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).unwrap();
+        let mut entry = archive.by_index(i).map_err(|e| format!("read zip entry #{i}: {e}"))?;
         let name = entry.name().to_string();
+        // --- zip-slip guard: никогда не выходим за пределы target ---
+        let parts: Vec<&str> = name.split('/').filter(|p| !p.is_empty() && *p != ".").collect();
+        if parts.iter().any(|p| *p == "..") {
+            return Err(format!("mrpack содержит небезопасный путь: {name}"));
+        }
+        let rel = parts.join("/");
+        let out = target.join(&rel);
         if entry.is_dir() {
-            let _ = std::fs::create_dir_all(target.join(&name));
+            let _ = std::fs::create_dir_all(&out);
             continue;
         }
         // top-level index already handled above; files have deeper path
-        let out = target.join(&name);
         if let Some(parent) = out.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
         }
         let mut buf = Vec::new();
         use std::io::Read;
-        entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+        entry.read_to_end(&mut buf).map_err(|e| format!("read {}: {e}", name))?;
         std::fs::write(&out, &buf).map_err(|e| format!("write {}: {e}", out.display()))?;
     }
     Ok(index)

@@ -41,11 +41,16 @@ pub fn make_client() -> reqwest::blocking::Client {
         .unwrap_or_default()
 }
 
-/// .minecraft root for the launcher
-pub fn launcher_root() -> PathBuf {
+/// .minecraft root for the launcher.
+///
+/// Возвращает путь в пользовательской директории (`dirs::data_dir()`), создаёт
+/// её и явно сообщает об ошибке, если прав на запись нет — вместо тихого
+/// игнорирования (раньше `let _ = create_dir_all` прятал PermissionDenied).
+pub fn launcher_root() -> Result<PathBuf, String> {
     let root = instance::default_dir();
-    let _ = std::fs::create_dir_all(&root);
-    root
+    std::fs::create_dir_all(&root)
+        .map_err(|e| format!("Cannot create launcher dir {}: {e}", root.display()))?;
+    Ok(root)
 }
 
 /// Install a vanilla Minecraft version into `instances/<name>/mines/`.
@@ -307,26 +312,48 @@ pub fn install_quilt(client: &Client, root: &Path, instance: &Instance, prog: Op
 
 /// Скачать installer-джару модового лоадера и прочитать из неё `version.json`
 /// (профиль лоадера: libraries + mainClass), не распаковывая остальное.
-fn download_fm_installer_version_json(client: &Client, url: &str, prog: Option<&Arc<InstallProgress>>) -> Result<String, String> {
+///
+/// Файл качается в ПАПКУ ИНСТАНСА (пользовательская директория с правами
+/// записи), а не в системный temp — это устраняет PermissionDenied на
+/// системах с ограниченным доступом к `TMP` и гарантирует, что распаковка
+/// происходит из места, куда мы точно можем писать.
+fn download_fm_installer_version_json(
+    client: &Client,
+    inst_dir: &Path,
+    url: &str,
+    prog: Option<&Arc<InstallProgress>>,
+) -> Result<String, String> {
     set_file(prog, "downloading loader installer");
-    // временный файл в папке инстанса — удалим после извлечения
-    let tmp = std::env::temp_dir().join(format!("limecraft-installer-{}.jar", std::process::id()));
+    let tmp_root = inst_dir.join(".tmp");
+    std::fs::create_dir_all(&tmp_root)
+        .map_err(|e| format!("Cannot create {}: {e}", tmp_root.display()))?;
+    let tmp = tmp_root.join(format!("installer-{}.jar", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
-    download::download_file_with_progress(client, url, &tmp, None).map_err(|e| format!("installer download: {e}"))?;
 
+    download::download_file_with_progress(client, url, &tmp, None).map_err(|e| format!("installer download: {e}"))?;
+    download::set_executable(&tmp)?;
+
+    // Закрываем все дескрипторы ДО удаления временного файла (на Windows
+    // открытый `File`/`ZipArchive` блокирует remove_file).
     let result = (|| {
         let file = std::fs::File::open(&tmp).map_err(|e| format!("open installer: {e}"))?;
         let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("installer not a zip: {e}"))?;
+        let mut found: Option<String> = None;
         for i in 0..archive.len() {
-            let mut entry = archive.by_index(i).unwrap();
+            let mut entry = archive
+                .by_index(i)
+                .map_err(|e| format!("read installer entry #{i}: {e}"))?;
             if entry.name() == "version.json" {
                 let mut text = String::new();
                 use std::io::Read;
                 entry.read_to_string(&mut text).map_err(|e| format!("read version.json: {e}"))?;
-                return Ok(text);
+                found = Some(text);
+                break;
             }
         }
-        Err("version.json not found in installer".to_string())
+        // явно дропаем архив до выхода из замыкания
+        drop(archive);
+        found.ok_or_else(|| "version.json not found in installer".to_string())
     })();
     let _ = std::fs::remove_file(&tmp);
     result
@@ -415,13 +442,13 @@ fn install_fm_installer(
     prog: Option<&Arc<InstallProgress>>,
 ) -> Result<String, String> {
     set_file(prog, &format!("downloading {label} {}", full_loader_version));
-    let vjson_text = download_fm_installer_version_json(client, installer_url, prog)?;
+    let mines = instance::instance_mines(root, &instance.name);
+    std::fs::create_dir_all(&mines).map_err(|e| format!("Cannot create {}: {e}", mines.display()))?;
+    let vjson_text = download_fm_installer_version_json(client, &mines, installer_url, prog)?;
     let profile: mojang::VersionJson = serde_json::from_str(&vjson_text).map_err(|e| format!("parse {label} json: {e}"))?;
     let profile_id = profile.id.clone();
 
     // 1) vanilla-основа
-    let mines = instance::instance_mines(root, &instance.name);
-    std::fs::create_dir_all(&mines).map_err(|e| e.to_string())?;
     let manifest = mojang::fetch_manifest(client).map_err(|e| e.to_string())?;
     let base_entry = mojang::find_version(&manifest, &instance.game_version)
         .ok_or_else(|| format!("MC {} not in manifest", instance.game_version))?;
@@ -641,15 +668,15 @@ pub fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
     if !src.is_dir() {
         return Ok(());
     }
-    std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
-    for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
+    std::fs::create_dir_all(dst).map_err(|e| format!("create dir {}: {e}", dst.display()))?;
+    for entry in std::fs::read_dir(src).map_err(|e| format!("read dir {}: {e}", src.display()))? {
         let entry = entry.map_err(|e| e.to_string())?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if from.is_dir() {
             copy_dir(&from, &to)?;
-        } else {
-            std::fs::create_dir_all(to.parent().unwrap()).ok();
+        } else if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
             std::fs::copy(&from, &to).map_err(|e| format!("copy {}: {e}", from.display()))?;
         }
     }

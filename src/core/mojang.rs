@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use super::download;
 
-pub const VERSION_MANIFEST_URL: &str = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json";
+pub const VERSION_MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct VersionEntry {
@@ -12,6 +12,15 @@ pub struct VersionEntry {
     pub kind: String, // release / snapshot / old_beta / old_alpha
     pub url: String,
     pub time: Option<String>,
+}
+
+/// Фильтр списка версий для UI (Пункт 2): по умолчанию — только релизы,
+/// с `include_snapshots = true` добавляются снапшоты. Беты/альфы не показываем.
+pub fn filter_versions<'a>(entries: &'a [VersionEntry], include_snapshots: bool) -> Vec<&'a VersionEntry> {
+    entries
+        .iter()
+        .filter(|v| v.kind == "release" || include_snapshots && v.kind == "snapshot")
+        .collect()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -339,5 +348,28 @@ mod tests {
 
         let any: Library = serde_json::from_str(r#"{"name":"a:b:1"}"#).unwrap();
         assert!(library_allowed(&any, "linux", "64"));
+    }
+
+    #[test]
+    fn filter_versions_release_snap() {
+        fn e(id: &str, kind: &str) -> VersionEntry {
+            VersionEntry { id: id.to_string(), kind: kind.to_string(), url: "u".into(), time: None }
+        }
+        let list = vec![
+            e("1.21.1", "release"),
+            e("1.21.2-pre1", "snapshot"),
+            e("b1.7.3", "old_beta"),
+            e("1.5.2", "release"),
+        ];
+        let rel = filter_versions(&list, false);
+        assert_eq!(rel.len(), 2);
+        assert_eq!(rel[0].id, "1.21.1");
+        assert_eq!(rel[1].id, "1.5.2");
+
+        let all = filter_versions(&list, true);
+        assert_eq!(all.len(), 3);
+        // порядок сохранён (манифест уже отсортирован по убыванию дат)
+        assert_eq!(all[1].id, "1.21.2-pre1");
+        assert!(all.iter().all(|v| v.kind != "old_beta"));
     }
 }

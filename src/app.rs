@@ -19,13 +19,16 @@ use crate::core::instance::{Instance, LauncherState};
 /// Shared result slot filled by a worker thread: `None` = still running.
 type Job<T> = Arc<Mutex<Option<Result<T, String>>>>;
 
+/// Активная вкладка (State). Три раздела по ТЗ:
+///  - `Instances` — «Сборки» (главная, по умолчанию): список установленных
+///    чистых клиентов (Vanilla/Fabric/Forge/NeoForge) + создание новых.
+///  - `Mods`     — «Моды»: каталог и управление модами (+ модпаки Modrinth).
+///  - `Other`    — «Другое»: ресурспаки, шейдеры, глобальные настройки.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
-    Home,
-    Versions,
-    Modpacks,
+    Instances,
     Mods,
-    Settings,
+    Other,
 }
 
 /// Run a blocking closure on a worker thread, exposing the result through a
@@ -93,12 +96,20 @@ pub struct LimeApp {
     // index of the "active" instance shared by Home / Mods / launch
     active_instance: usize,
 
-    // ---- Versions ----
+    // ---- Пункт 2: версии из манифеста Mojang ----
     versions_job: Option<Job<Vec<mojang::VersionEntry>>>,
     versions_list: Vec<mojang::VersionEntry>,
     selected_version: String,
-    version_install_prog: Option<Arc<install::InstallProgress>>,
-    version_install_job: Option<Job<()>>,
+    /// Показывать снапшоты/беты в списке версий (по умолчанию — только релизы).
+    show_snapshots: bool,
+    /// Манифест уже запрошен хотя бы раз (чтобы не спамить сетевой запрос).
+    manifest_requested: bool,
+
+    // ---- Пункт 4: окно «Настройки» конкретной сборки ----
+    instance_settings: Option<usize>,
+
+    /// Под-раздел вкладки «Моды»: false = каталог модов, true = модпаки Modrinth.
+    mods_show_modpacks: bool,
 
     // ---- Modpacks ----
     pack_search_query: String,
@@ -144,7 +155,13 @@ pub struct LimeApp {
 impl LimeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_fonts(&cc.egui_ctx);
-        let root = install::launcher_root();
+        let root = install::launcher_root().unwrap_or_else(|e| {
+            // Корневая папка недоступна для записи — вместо тихого сбоя
+            // установки показываем понятную ошибку через panic-хук.
+            eprintln!("LimeCraft: {e}");
+            let msg = format!("Нет доступа к папке данных: {e}.");
+            panic!("{msg}");
+        });
         let mut state = instance::load_state(&root);
         if state.account.is_none() {
             state.account = Some(account::Account::offline_default());
@@ -157,15 +174,17 @@ impl LimeApp {
         Self {
             root,
             state: state.clone(),
-            page: Page::Home,
+            page: Page::Instances,
             assets: Assets::load(&cc.egui_ctx),
             toast: None,
             active_instance: 0,
             versions_job: None,
             versions_list: Vec::new(),
             selected_version,
-            version_install_prog: None,
-            version_install_job: None,
+            show_snapshots: false,
+            manifest_requested: false,
+            instance_settings: None,
+            mods_show_modpacks: false,
             pack_search_query: String::new(),
             pack_search_job: None,
             pack_results: Vec::new(),
@@ -262,11 +281,9 @@ impl eframe::App for LimeApp {
         // 2) nav on the left + content in the middle
         egui::Panel::left("nav_panel").show(ui, |ui| self.draw_nav(ui));
         egui::CentralPanel::default().show(ui, |ui| match self.page {
-            Page::Home => self.draw_home(ui),
-            Page::Versions => self.draw_versions(ui),
-            Page::Modpacks => self.draw_modpacks(ui),
+            Page::Instances => self.draw_instances(ui),
             Page::Mods => self.draw_mods(ui),
-            Page::Settings => self.draw_settings(ui),
+            Page::Other => self.draw_other(ui),
         });
 
         // transient toast window (top-right)
@@ -282,6 +299,11 @@ impl eframe::App for LimeApp {
 
         if self.show_new_instance {
             self.draw_new_instance_dialog(ui.ctx());
+        }
+
+        // Пункт 4: окно «Настройки сборки» (заглушка) для выбранного инстанса
+        if let Some(idx) = self.instance_settings {
+            self.draw_instance_settings(ui.ctx(), idx);
         }
     }
 }
@@ -307,11 +329,9 @@ impl LimeApp {
         ui.add_space(18.0);
 
         let items = [
-            (Page::Home, "Главная"),
-            (Page::Versions, "Версии"),
-            (Page::Modpacks, "Сборки"),
+            (Page::Instances, "Сборки"),
             (Page::Mods, "Моды"),
-            (Page::Settings, "Настройки"),
+            (Page::Other, "Другое"),
         ];
         for (page, label) in items {
             let selected = self.page == page;
@@ -365,30 +385,6 @@ impl LimeApp {
                         ));
                     }
                     Err(e) => self.toast = Some(format!("Ошибка манифеста: {e}")),
-                }
-            }
-        }
-
-        // vanilla install (page)
-        if let Some(job) = &self.version_install_job {
-            if let Some(res) = drain(job) {
-                self.version_install_job = None;
-                self.version_install_prog = None;
-                match res {
-                    Ok(()) => {
-                        let name = self.selected_version.clone();
-                        self.upsert_instance(Instance {
-                            name: name.clone(),
-                            game_version: name.clone(),
-                            loader: String::new(),
-                            loader_version: String::new(),
-                            version_name: Some(format!("{name}.json")),
-                            modpack_slug: None,
-                            created: now_string(),
-                        });
-                        self.toast = Some(format!("Версия {name} установлена"));
-                    }
-                    Err(e) => self.toast = Some(format!("Ошибка установки: {e}")),
                 }
             }
         }
@@ -501,76 +497,120 @@ impl LimeApp {
 // ------------------------------------------------------------------ Home
 
 impl LimeApp {
-    fn draw_home(&mut self, ui: &mut egui::Ui) {
-        let rect = ui.max_rect();
+    /// Главная вкладка «Сборки»: список установленных чистых клиентов
+    /// (Vanilla/Fabric/Forge/NeoForge) + создание новой из списка версий.
+    fn draw_instances(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(12.0);
+        ui.heading(RichText::new("Сборки").size(26.0).color(theme::GREEN_DARK));
+        ui.label(RichText::new("Чистые клиенты Minecraft с загрузчиком (без модов).").color(theme::MUTED).size(13.0));
+        ui.add_space(10.0);
 
-        // hero background + dim overlay
-        if let Some(hero) = &self.assets.hero {
-            let painter = ui.painter_at(rect);
-            crate::assets::paint_cover(&painter, hero, rect, Color32::WHITE);
-            painter.rect_filled(rect, egui::CornerRadius::ZERO, Color32::from_black_alpha(55));
-        }
+        // ---- Установка новой сборки из списка версий (Пункт 2) ----
+        egui::Frame::new()
+            .fill(theme::CARD)
+            .stroke(Stroke::new(1.0, theme::DIVIDER))
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.label(RichText::new("Новая сборка").size(16.0).strong().color(theme::TEXT));
+                ui.add_space(6.0);
+                // Устанавливаю внутренний UI сборочного мастера
+                self.draw_new_build_wizard(ui);
+            });
 
-        ui.vertical_centered(|ui| {
-            ui.add_space(64.0);
-            if let Some(badge) = &self.assets.badge {
-                ui.add(
-                    egui::Image::new(egui::load::SizedTexture::from_handle(badge))
-                        .max_size(egui::vec2(150.0, 150.0)),
-                );
+        ui.add_space(16.0);
+        ui.separator();
+        ui.label(RichText::new("Установленные сборки").color(theme::MUTED).size(13.0));
+        ui.add_space(6.0);
+        if self.state.instances.is_empty() {
+            if let Some(empty) = &self.assets.empty_state {
+                ui.add_space(24.0);
+                ui.centered_and_justified(|ui| {
+                    ui.add(egui::Image::new(egui::load::SizedTexture::from_handle(empty)).max_size(egui::vec2(140.0, 140.0)));
+                });
             }
-            ui.add_space(4.0);
-            ui.label(RichText::new("LimeCraft").size(42.0).color(Color32::WHITE).strong());
-            ui.label(
-                RichText::new("Лёгкий лаунчер для Minecraft")
-                    .size(16.0)
-                    .color(Color32::from_rgb(0xDC, 0xF4, 0xDD)),
-            );
-            ui.add_space(24.0);
-
-            if self.state.instances.is_empty() {
-                ui.label(
-                    RichText::new("Создайте инстанс или установите версию во вкладке «Версии».")
-                        .color(Color32::WHITE),
-                );
-            } else {
-                let names: Vec<String> = self.state.instances.iter().map(|i| i.name.clone()).collect();
-                let mut sel = self.active_index();
-                egui::ComboBox::from_label("Инстанс")
-                    .selected_text(RichText::new(&names[sel]).color(theme::TEXT).strong())
-                    .show_ui(ui, |ui| {
-                        for (idx, n) in names.iter().enumerate() {
-                            if ui.selectable_label(idx == sel, n.clone()).clicked() {
-                                sel = idx;
-                            }
-                        }
+            ui.centered_and_justified(|ui| {
+                ui.label(RichText::new("Пока нет сборок — создайте первую выше.").color(theme::MUTED));
+            });
+        } else {
+            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                for idx in 0..self.state.instances.len() {
+                    let inst = self.state.instances[idx].clone();
+                    let selected = idx == self.active_index();
+                    let frame = egui::Frame::new()
+                        .fill(if selected { theme::GREEN_PALE } else { theme::CARD })
+                        .stroke(if selected { Stroke::new(1.5, theme::GREEN) } else { Stroke::new(1.0, theme::DIVIDER) })
+                        .corner_radius(egui::CornerRadius::same(10))
+                        .inner_margin(egui::Margin::same(12));
+                    frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&inst.name).size(16.0).strong().color(theme::TEXT));
+                                    let loader = if inst.loader.is_empty() { "vanilla" } else { &inst.loader };
+                                    ui.label(RichText::new(format!("MC {} · {}", inst.game_version, loader)).color(theme::YELLOW_DARK).size(12.0));
+                                    if let Some(mb) = inst.memory_mb {
+                                        ui.label(RichText::new(format!("RAM {mb} МБ")).color(theme::MUTED).size(12.0));
+                                    }
+                                });
+                                if inst.modpack_slug.is_some() {
+                                    ui.label(RichText::new("модпак (Modrinth)").color(theme::MUTED).size(12.0));
+                                }
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .add(egui::Button::new(RichText::new("⚙").size(20.0).color(theme::MUTED)))
+                                    .on_hover_text("Настройки сборки")
+                                    .clicked()
+                                {
+                                    self.instance_settings = Some(idx);
+                                }
+                                if ui
+                                    .add(egui::Button::new(RichText::new("🗑").size(18.0).color(theme::DANGER)))
+                                    .on_hover_text("Удалить сборку")
+                                    .clicked()
+                                {
+                                    self.remove_instance(idx);
+                                }
+                                let play_btn = egui::Button::new(RichText::new("▶  Играть").size(16.0).color(Color32::WHITE).strong())
+                                    .fill(theme::GREEN)
+                                    .corner_radius(egui::CornerRadius::same(10))
+                                    .min_size(egui::vec2(120.0, 34.0));
+                                if ui.add(play_btn).clicked() {
+                                    self.active_instance = idx;
+                                    self.launch_selected();
+                                }
+                            });
+                        });
                     });
-                self.active_instance = sel;
-
-                ui.add_space(18.0);
-                let play_btn = egui::Button::new(
-                    RichText::new("▶  Играть").size(26.0).color(Color32::WHITE).strong(),
-                )
-                .fill(theme::GREEN)
-                .corner_radius(egui::CornerRadius::same(18))
-                .min_size(egui::vec2(230.0, 54.0));
-                if ui.add(play_btn).clicked() {
-                    self.launch_selected();
+                    ui.add_space(6.0);
                 }
-                if let Some(status) = &self.launch_status {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(status).size(13.0).color(Color32::WHITE));
-                }
+            });
+            if let Some(status) = &self.launch_status {
+                ui.add_space(6.0);
+                ui.label(RichText::new(status).size(13.0).color(theme::MUTED));
             }
-
-            ui.add_space(22.0);
+        }
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
             if ui
-                .add(egui::Button::new(RichText::new("＋ Создать инстанс").size(16.0).color(theme::GREEN_DARK)))
+                .add(egui::Button::new(RichText::new("＋ Создать сборку по-шагово").size(15.0).color(theme::GREEN_DARK)))
                 .clicked()
             {
                 self.open_new_instance_dialog();
             }
         });
+    }
+
+    fn remove_instance(&mut self, idx: usize) {
+        if idx < self.state.instances.len() {
+            self.state.instances.remove(idx);
+            if self.active_instance >= self.state.instances.len() && !self.state.instances.is_empty() {
+                self.active_instance = self.state.instances.len() - 1;
+            }
+            self.save_state();
+            self.toast = Some("Сборка удалена".to_string());
+        }
     }
 
     fn launch_selected(&mut self) {
@@ -620,10 +660,19 @@ impl LimeApp {
 // ------------------------------------------------------------------ Versions
 
 impl LimeApp {
-    fn draw_versions(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(12.0);
-        ui.heading(RichText::new("Версии Minecraft").size(26.0).color(theme::GREEN_DARK));
-        ui.add_space(8.0);
+    /// Встроенный мастер создания новой сборки: список версий из манифеста
+    /// Mojang (релизы по умолчанию + чекбокс снапшотов), выбор лоадера, запуск
+    /// установки. Рендерится внутри главной вкладки «Сборки».
+    fn draw_new_build_wizard(&mut self, ui: &mut egui::Ui) {
+        // Автозагрузка манифеста при первом открытии — новичку не нужно
+        // знать версии наизусть.
+        if !self.manifest_requested && self.versions_job.is_none() && self.versions_list.is_empty() {
+            self.manifest_requested = true;
+            let client = install::make_client();
+            self.versions_job = Some(start_detached(&client, |c| {
+                mojang::fetch_manifest(c).map(|m| m.versions).map_err(|e| e.to_string())
+            }));
+        }
 
         ui.horizontal(|ui| {
             if ui.button("🔃 Обновить список").clicked() {
@@ -638,27 +687,39 @@ impl LimeApp {
             }
         });
 
-        ui.add_space(10.0);
-
         if self.versions_list.is_empty() {
-            if let Some(empty) = &self.assets.empty_state {
-                ui.centered_and_justified(|ui| {
-                    ui.add(egui::Image::new(egui::load::SizedTexture::from_handle(empty)).max_size(egui::vec2(160.0, 160.0)));
-                });
-            }
-            ui.centered_and_justified(|ui| {
-                ui.label(RichText::new("Нажмите «Обновить список» — версии придут из манифеста Mojang.").color(theme::MUTED));
-            });
+            ui.label(RichText::new("Список версий загружается…").color(theme::MUTED).size(13.0));
             return;
         }
 
-        // version picker
+        // ---- Пункт 2: фильтр только релизов + чекбокс снапшотов ----
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.show_snapshots, "Показывать снапшоты");
+            if self.show_snapshots {
+                ui.label(RichText::new("(релизы всегда отображаются)").color(theme::MUTED).size(12.0));
+            }
+        });
+
+        let filtered = mojang::filter_versions(&self.versions_list, self.show_snapshots);
+        if filtered.is_empty() {
+            ui.label(RichText::new("В манифесте нет релизов. Нажмите «Обновить список».").color(theme::MUTED));
+            return;
+        }
+        if !filtered.iter().any(|v| v.id == self.selected_version) {
+            self.selected_version = filtered[0].id.clone();
+        }
+
+        // Выбор версии (ComboBox)
         let mut version = self.selected_version.clone();
-        egui::ComboBox::from_label("Версия")
-            .selected_text(RichText::new(&version).color(theme::TEXT).size(16.0))
+        egui::ComboBox::from_label("Версия Minecraft")
+            .selected_text(RichText::new(&version).color(theme::TEXT).size(15.0))
             .show_ui(ui, |ui| {
-                for entry in &self.versions_list {
-                    let label = format!("{} ▸ {}", entry.id, entry.kind);
+                for entry in filtered {
+                    let label = if entry.kind == "release" {
+                        format!("{} (релиз)", entry.id)
+                    } else {
+                        format!("{} (снапшот)", entry.id)
+                    };
                     if ui.selectable_label(entry.id == version, label).clicked() {
                         version = entry.id.clone();
                     }
@@ -666,60 +727,81 @@ impl LimeApp {
             });
         self.selected_version = version;
 
-        ui.add_space(10.0);
+        // Выбор лоадера
+        let loaders = [
+            ("", "Vanilla (чистый клиент)"),
+            ("fabric", "Fabric"),
+            ("quilt", "Quilt"),
+            ("forge", "Forge"),
+            ("neoforge", "NeoForge"),
+        ];
+        let cur = self.new_instance_loader.clone();
+        egui::ComboBox::from_label("Загрузчик")
+            .selected_text(loaders.iter().find(|(v, _)| *v == cur).map(|(_, l)| *l).unwrap_or("Vanilla (чистый клиент)"))
+            .show_ui(ui, |ui| {
+                for (val, label) in loaders {
+                    if ui.selectable_label(cur == val, label).clicked() {
+                        self.new_instance_loader = val.to_string();
+                    }
+                }
+            });
+
+        // Кнопка установки + прогресс
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            if ui
-                .add(egui::Button::new(RichText::new("⬇ Установить / Загрузить").size(16.0).color(theme::GREEN_DARK)))
-                .clicked()
-            {
-                self.start_version_install();
-            }
-            if self.version_install_job.is_some() {
+            if self.new_instance_job.is_none() {
+                if ui
+                    .add(egui::Button::new(RichText::new("⬇ Установить сборку").size(15.0).color(theme::GREEN_DARK)))
+                    .clicked()
+                {
+                    self.start_wizard_install();
+                }
+            } else {
                 ui.add(egui::Spinner::new());
+                ui.label(RichText::new("Установка…").color(theme::MUTED));
+            }
+            match &self.new_instance_result {
+                Some(Ok(())) => {
+                    ui.label(RichText::new("✓ Сборка установлена").color(theme::SUCCESS));
+                }
+                Some(Err(e)) => {
+                    ui.label(RichText::new(format!("Ошибка: {e}")).color(theme::DANGER));
+                }
+                None => {}
             }
         });
-
-        if let Some(prog) = &self.version_install_prog {
+        if let Some(prog) = &self.new_instance_prog {
             ui.add_space(8.0);
             self.install_progress_bar(ui, prog, Some(&prog.cancelled));
         }
-
-        ui.add_space(16.0);
-        ui.separator();
-        ui.label(RichText::new("Список версий из манифеста").color(theme::MUTED).size(13.0));
-        egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-            for entry in &self.versions_list {
-                let mut row_clicked = false;
-                ui.horizontal(|ui| {
-                    let label = RichText::new(&entry.id).size(14.0);
-                    if ui.selectable_label(entry.id == self.selected_version, label).clicked() {
-                        row_clicked = true;
-                    }
-                    ui.label(RichText::new(&entry.kind).color(theme::YELLOW_DARK).size(11.0));
-                });
-                if row_clicked {
-                    self.selected_version = entry.id.clone();
-                }
-            }
-        });
     }
 
-    fn start_version_install(&mut self) {
+    fn start_wizard_install(&mut self) {
         let version = self.selected_version.clone();
         if version.is_empty() || version == "latest" {
             self.toast = Some("Сначала выберите версию".to_string());
             return;
         }
+        self.new_instance_name = version.clone();
+        self.new_instance_version = version.clone();
+        let instance = Instance {
+            name: self.new_instance_name.clone(),
+            game_version: self.new_instance_version.clone(),
+            loader: self.new_instance_loader.clone(),
+            loader_version: String::new(),
+            version_name: None,
+            modpack_slug: None,
+            created: now_string(),
+            ..Default::default()
+        };
         let client = install::make_client();
         let root = self.root.clone();
         let prog = Arc::new(install::InstallProgress::new());
         let prog_ref = prog.clone();
-        let instance_name = version.clone();
-        let job = start_detached(&client, move |c| {
-            install::install_vanilla(c, &root, &instance_name, &version, Some(&prog_ref))
-        });
-        self.version_install_prog = Some(prog);
-        self.version_install_job = Some(job);
+        let job = start_detached(&client, move |c| install::install_instance(c, &root, &instance, Some(&prog_ref)));
+        self.new_instance_prog = Some(prog);
+        self.new_instance_job = Some(job);
+        self.new_instance_result = None;
     }
 }
 
@@ -854,6 +936,7 @@ impl LimeApp {
             version_name: None,
             modpack_slug: Some(slug),
             created: now_string(),
+            ..Default::default()
         };
         self.upsert_instance(instance.clone());
 
@@ -876,11 +959,28 @@ impl LimeApp {
 // ------------------------------------------------------------------ Mods
 
 impl LimeApp {
+    /// Вкладка «Моды»: переключатель «Моды / Модпаки (Modrinth)» + контент.
     fn draw_mods(&mut self, ui: &mut egui::Ui) {
         ui.add_space(12.0);
-        ui.heading(RichText::new("Моды (Modrinth)").size(26.0).color(theme::GREEN_DARK));
+        ui.heading(RichText::new("Моды").size(26.0).color(theme::GREEN_DARK));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            for (val, label) in [(false, "Каталог модов"), (true, "Модпаки (Modrinth)")] {
+                if ui.selectable_label(self.mods_show_modpacks == val, label).clicked() {
+                    self.mods_show_modpacks = val;
+                }
+            }
+        });
         ui.add_space(8.0);
+        if self.mods_show_modpacks {
+            self.draw_modpacks(ui);
+        } else {
+            self.draw_mods_catalog(ui);
+        }
+    }
 
+    fn draw_mods_catalog(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.mod_search_query)
@@ -1097,10 +1197,27 @@ impl LimeApp {
 // ------------------------------------------------------------------ Settings
 
 impl LimeApp {
-    fn draw_settings(&mut self, ui: &mut egui::Ui) {
+    /// Вкладка «Другое» (ресурспаки, шейдеры, глобальные настройки).
+    fn draw_other(&mut self, ui: &mut egui::Ui) {
         ui.add_space(12.0);
-        ui.heading(RichText::new("Настройки").size(26.0).color(theme::GREEN_DARK));
+        ui.heading(RichText::new("Другое").size(26.0).color(theme::GREEN_DARK));
+        ui.label(RichText::new("Ресурспаки, шейдеры и глобальные настройки.").color(theme::MUTED).size(13.0));
         ui.add_space(12.0);
+
+        // ---- Задел: ресурспаки / шейдеры (заглушки) ----
+        egui::Frame::new()
+            .fill(theme::CARD)
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(egui::Margin::same(16))
+            .show(ui, |ui| {
+                ui.label(RichText::new("Ресурспаки").strong().color(theme::TEXT));
+                ui.label(RichText::new("Управление ресурспаками появится в следующем обновлении.").color(theme::MUTED).size(13.0));
+                ui.add_space(10.0);
+                ui.label(RichText::new("Шейдеры").strong().color(theme::TEXT));
+                ui.label(RichText::new("Управление шейдерами появится в следующем обновлении.").color(theme::MUTED).size(13.0));
+            });
+
+        ui.add_space(16.0);
 
         egui::Frame::new()
             .fill(theme::CARD)
@@ -1205,6 +1322,63 @@ impl LimeApp {
                 acc.username = name.to_string();
             }
         }
+    }
+}
+
+// ------------------------------------------------------------------ Instance settings dialog (Пункт 4)
+
+impl LimeApp {
+    /// Окно-заглушка «Настройки сборки». Здесь будет логика RAM/JVM/Java/иконки
+    /// для конкретной сборки; сейчас заложен каркас (`Option`-поля в Instance)
+    /// и простая наглядная панель.
+    fn draw_instance_settings(&mut self, ctx: &egui::Context, idx: usize) {
+        let Some(inst) = self.state.instances.get(idx).cloned() else {
+            self.instance_settings = None;
+            return;
+        };
+        egui::Window::new(format!("⚙ Настройки — {}", inst.name))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                let loader = if inst.loader.is_empty() { "vanilla" } else { &inst.loader };
+                ui.label(
+                    RichText::new(format!("Minecraft {} · {}", inst.game_version, loader))
+                        .color(theme::MUTED)
+                        .size(13.0),
+                );
+                ui.add_space(10.0);
+                ui.label(RichText::new("Индивидуальные настройки сборки").strong().color(theme::TEXT));
+                ui.label(
+                    RichText::new("RAM, JVM-аргументы, Java и иконка появятся в следующем обновлении. Каркас уже заложен в профиль сборки.")
+                        .color(theme::MUTED)
+                        .size(13.0),
+                );
+
+                ui.add_space(10.0);
+                // Инфо-поля, чтобы было видно задел (Option-поля в Instance)
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Память (МБ):").color(theme::MUTED));
+                    ui.label(RichText::new(inst.memory_mb.map(|m| m.to_string()).unwrap_or_else(|| "глобальная".into())).size(13.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("JVM-аргументы:").color(theme::MUTED));
+                    ui.label(RichText::new(inst.jvm_args.clone().unwrap_or_else(|| "—".into())).size(13.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Java:").color(theme::MUTED));
+                    ui.label(RichText::new(inst.java_path.clone().unwrap_or_else(|| "глобальная".into())).size(13.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Иконка:").color(theme::MUTED));
+                    ui.label(RichText::new(inst.icon.clone().unwrap_or_else(|| "—".into())).size(13.0));
+                });
+
+                ui.add_space(12.0);
+                if ui.button("Закрыть").clicked() {
+                    self.instance_settings = None;
+                }
+            });
     }
 }
 
@@ -1362,6 +1536,7 @@ impl LimeApp {
             version_name: None,
             modpack_slug: None,
             created: now_string(),
+            ..Default::default()
         };
 
         let client = install::make_client();
