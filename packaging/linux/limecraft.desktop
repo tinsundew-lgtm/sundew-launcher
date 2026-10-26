@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=LimeCraft
+GenericName=Minecraft launcher
+Comment=Launcher for Minecraft with mods, modpacks and offline skins
+Exec=limecraft-launcher
+Icon=limecraft
+Terminal=false
+Categories=Game;
+Keywords=minecraft;launcher;mods;fabric;forge;
+StartupWMClass=limecraft-launcher

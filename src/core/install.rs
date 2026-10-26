@@ -1,17 +1,20 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use reqwest::blocking::Client;
 
 use super::download;
 use super::instance::{self, Instance};
-use super::mojang;
+use super::launch;
 use super::modrinth;
+use super::mojang;
 
 pub const OS: &str = if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "osx" } else { "linux" };
 pub const ARCH: &str = if cfg!(target_arch = "aarch64") { "aarch64" } else { "64" };
+
+/// Parallel download workers for assets.
+const ASSET_WORKERS: usize = 8;
 
 /// A single shared progress object used by the UI thread.
 pub struct InstallProgress {
@@ -32,11 +35,28 @@ impl InstallProgress {
     }
 }
 
-/// Build a Modrinth client.
+/// Cancellation flag of an optional progress object.
+fn cancel_flag(prog: Option<&Arc<InstallProgress>>) -> Option<&AtomicBool> {
+    prog.map(|p| &p.cancelled)
+}
+
+fn check_cancel(prog: Option<&Arc<InstallProgress>>) -> Result<(), String> {
+    if cancel_flag(prog).map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+        Err("Cancelled".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// Build the shared HTTP client (with timeouts: a hung server must not hang
+/// the install forever).
 pub fn make_client() -> reqwest::blocking::Client {
     Client::builder()
         .user_agent("LimeCraft-Launcher/0.1 (Minecraft launcher)")
         .gzip(true)
+        .connect_timeout(std::time::Duration::from_secs(8))
+        // long: whole-body limit for big downloads; API calls set their own 25 s limit
+        .timeout(std::time::Duration::from_secs(1800))
         .build()
         .unwrap_or_default()
 }
@@ -44,18 +64,12 @@ pub fn make_client() -> reqwest::blocking::Client {
 /// .minecraft root for the launcher.
 ///
 /// Возвращает путь в пользовательской директории (`dirs::data_dir()`), создаёт
-/// её и явно сообщает об ошибке, если прав на запись нет — вместо тихого
-/// игнорирования (раньше `let _ = create_dir_all` прятал PermissionDenied).
+/// её и явно сообщает об ошибке, если прав на запись нет.
 pub fn launcher_root() -> Result<PathBuf, String> {
-    let root = instance::default_dir();
-    std::fs::create_dir_all(&root)
-        .map_err(|e| format!("Cannot create launcher dir {}: {e}", root.display()))?;
-    Ok(root)
+    instance::resolve_root()
 }
 
 /// Install a vanilla Minecraft version into `instances/<name>/mines/`.
-/// The version json is saved as `versions/<id>.json` (matching what
-/// `launch::build_launch_command` reads for vanilla instances).
 pub fn install_vanilla(
     client: &Client,
     root: &Path,
@@ -63,33 +77,42 @@ pub fn install_vanilla(
     version_id: &str,
     prog: Option<&Arc<InstallProgress>>,
 ) -> Result<(), String> {
-    set_file(prog, &format!("Fetching versions for {version_id}"));
-    let manifest = mojang::fetch_manifest(client).map_err(|e| e.to_string())?;
-    let entry = mojang::find_version(&manifest, version_id).ok_or_else(|| format!("Version {version_id} not found in manifest"))?;
-    let vjson = mojang::fetch_version_json(client, &entry).map_err(|e| e.to_string())?;
     let mines = instance::instance_mines(root, instance_name);
-    install_version_json(client, &mines, &vjson, prog)
+    install_base(client, &mines, version_id, prog).map(|_| ())
 }
 
-/// Given a version.json, download client jar + libs + assets and write the
-/// version json into `versions/<id>.json` of the given `.minecraft`-style dir.
-pub fn install_version_json(client: &Client, root: &Path, vjson: &mojang::VersionJson, prog: Option<&Arc<InstallProgress>>) -> Result<(), String> {
-    download_version_files(client, root, vjson, prog)?;
+/// Install vanilla `version_id` (client jar, libraries, assets) and store the
+/// ORIGINAL Mojang json as `versions/<id>.json` — loader profiles reference it
+/// through `inheritsFrom`. Returns the parsed json.
+fn install_base(
+    client: &Client,
+    mines: &Path,
+    version_id: &str,
+    prog: Option<&Arc<InstallProgress>>,
+) -> Result<mojang::VersionJson, String> {
+    set_file(prog, &format!("Fetching versions for {version_id}"));
+    let manifest = mojang::fetch_manifest(client)?;
+    let entry = mojang::find_version(&manifest, version_id)
+        .ok_or_else(|| format!("Version {version_id} not found in manifest"))?;
+    let (vjson, text) = mojang::fetch_version_json_text(client, &entry)?;
+    download_version_files(client, mines, &vjson, prog)?;
+    write_version_json(mines, &vjson.id, &text)?;
+    Ok(vjson)
+}
 
-    let version_dir = root.join("versions");
-    let _ = std::fs::create_dir_all(&version_dir);
-    let json_path = version_dir.join(format!("{}.json", vjson.id));
-    if !json_path.exists() {
-        set_file(prog, &format!("saving {}.json", vjson.id));
-        let text = serde_json::to_string_pretty(vjson).map_err(|e| e.to_string())?;
-        std::fs::write(&json_path, text).map_err(|e| format!("Cannot write {}: {e}", json_path.display()))?;
-    }
-    Ok(())
+/// Write `versions/<id>.json` atomically.
+fn write_version_json(mines: &Path, id: &str, text: &str) -> Result<(), String> {
+    let version_dir = mines.join("versions");
+    std::fs::create_dir_all(&version_dir).map_err(|e| format!("Cannot create {}: {e}", version_dir.display()))?;
+    let path = instance::safe_join(&version_dir, &format!("{id}.json"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("Cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("Cannot write {}: {e}", path.display()))
 }
 
 /// Download client jar + libraries (+ assets) for a given version json.
 /// Does NOT write any version json, so the caller stays in control of the file
-/// name (used by install_fabric to avoid id collisions).
+/// name.
 fn download_version_files(client: &Client, root: &Path, vjson: &mojang::VersionJson, prog: Option<&Arc<InstallProgress>>) -> Result<(), String> {
     let id = &vjson.id;
     let libs_dir = root.join("libraries");
@@ -103,28 +126,25 @@ fn download_version_files(client: &Client, root: &Path, vjson: &mojang::VersionJ
         if !mojang::library_allowed(lib, OS, ARCH) {
             continue;
         }
-        if lib.natives.is_some() {
-            // LWJGL natives: download the OS-specific classifier jar into the
-            // libraries dir so it lands on the classpath. LWJGL3 extracts the
-            // native DLL/SO from its own jar at runtime.
-            if let (Some(map), Some(dl)) = (&lib.natives, &lib.downloads) {
-                if let Some(classifier_name) = map.get(OS) {
-                    if let Some(art) = dl.classifiers.as_ref().and_then(|c| c.get(classifier_name)).cloned() {
-                        if !art.url.is_empty() {
-                            let sha = if art.sha1.is_empty() { None } else { Some(art.sha1.clone()) };
-                            lib_files.push((art.path.clone(), art.url.clone(), sha));
-                        }
+        if let Some(map) = &lib.natives {
+            // Legacy natives: download the OS classifier jar; it is unpacked
+            // into the natives dir at launch time.
+            if let (Some(classifier), Some(dl)) = (map.get(OS), &lib.downloads) {
+                let classifier = classifier.replace("${arch}", "64");
+                if let Some(art) = dl.classifiers.as_ref().and_then(|c| c.get(&classifier)) {
+                    if !art.url.is_empty() {
+                        let sha = Some(art.sha1.clone()).filter(|s| !s.is_empty());
+                        lib_files.push((art.path.clone(), art.url.clone(), sha));
                     }
                 }
             }
             continue; // main artifact not needed for natives
         }
-        // Handle both Mojang `downloads.artifact` and Maven `name`+`url` formats
-        let path = lib.artifact_path();
-        let url = lib.artifact_url();
-        if let Some(url) = url {
-            let sha = lib.sha1_hex();
-            lib_files.push((path.unwrap_or_default(), url, sha));
+        // Handle both Mojang `downloads.artifact` and Maven `name`+`url` formats.
+        // Libraries without a URL (e.g. produced by the Forge installer) are
+        // not downloadable here and are skipped.
+        if let (Some(path), Some(url)) = (lib.artifact_path(), lib.artifact_url()) {
+            lib_files.push((path, url, lib.sha1_hex()));
         }
     }
 
@@ -136,31 +156,25 @@ fn download_version_files(client: &Client, root: &Path, vjson: &mojang::VersionJ
         done += 1;
         set_file(prog, &format!("client-{id}.jar"));
         update_progress(prog, done, total_count);
-        let dest = version_dir.join(format!("{id}.jar"));
-        download::download_file(client, &client_dl.url, &dest, client_dl.sha1.as_deref())
-            .map_err(|e| e.to_string())?;
+        let dest = instance::safe_join(&version_dir, &format!("{id}.jar"))?;
+        download::download_file_ex(client, &client_dl.url, &dest, client_dl.sha1.as_deref(), cancel_flag(prog), None)?;
     }
 
     // Libraries
     for (rel_path, url, sha) in lib_files {
+        check_cancel(prog)?;
         done += 1;
         let fname = rel_path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
         set_file(prog, &fname);
         update_progress(prog, done, total_count);
-        let dest = libs_dir.join(&rel_path);
-        download::download_file(client, &url, &dest, sha.as_deref()).map_err(|e| e.to_string())?;
+        let dest = instance::safe_join(&libs_dir, &rel_path.to_string_lossy())?;
+        download::download_file_ex(client, &url, &dest, sha.as_deref(), cancel_flag(prog), None)?;
     }
 
     // Assets index + assets
     set_file(prog, "assets");
     if let Some(asset_index) = &vjson.asset_index {
         install_assets(client, root, asset_index, prog)?;
-    } else if let Some(assets_id) = &vjson.assets {
-        // Legacy versions carry only the id; create the directory skeleton so
-        // the launcher can still point --assetsDir there.
-        let _ = std::fs::create_dir_all(root.join("assets/indexes"));
-        let _ = std::fs::create_dir_all(root.join("assets/objects"));
-        let _ = assets_id;
     }
 
     set_file(prog, "done");
@@ -182,7 +196,8 @@ fn set_file(prog: Option<&Arc<InstallProgress>>, name: &str) {
 }
 
 /// Download the asset index json for `asset_index` into `assets/indexes/<id>.json`,
-/// then fetch every object into `assets/objects/<ab>/<hash>`, reporting progress.
+/// then fetch every object into `assets/objects/<ab>/<hash>` using a small
+/// worker pool, reporting progress.
 fn install_assets(client: &Client, root: &Path, asset_index: &mojang::AssetIndex, prog: Option<&Arc<InstallProgress>>) -> Result<(), String> {
     let indexes_dir = root.join("assets/indexes");
     let objects_dir = root.join("assets/objects");
@@ -190,44 +205,58 @@ fn install_assets(client: &Client, root: &Path, asset_index: &mojang::AssetIndex
     std::fs::create_dir_all(&objects_dir).map_err(|e| format!("Cannot create {}: {e}", objects_dir.display()))?;
 
     // 1. Asset index file
-    let index_path = indexes_dir.join(format!("{}.json", asset_index.id));
+    let index_path = instance::safe_join(&indexes_dir, &format!("{}.json", asset_index.id))?;
     set_file(prog, &format!("asset-index {}.json", asset_index.id));
     let index_sha = if asset_index.sha1.is_empty() { None } else { Some(asset_index.sha1.as_str()) };
-    download::download_file(client, &asset_index.url, &index_path, index_sha).map_err(|e| e.to_string())?;
+    download::download_file_ex(client, &asset_index.url, &index_path, index_sha, cancel_flag(prog), None)?;
 
     // 2. Parse objects
     let index_text = std::fs::read_to_string(&index_path).map_err(|e| format!("Cannot read {}: {e}", index_path.display()))?;
     let index: mojang::AssetIndexFile =
         serde_json::from_str(&index_text).map_err(|e| format!("Cannot parse asset index {}: {e}", index_path.display()))?;
 
-    // Decide which objects must be materialized on disk: only entries with
-    // size > 0 are actual downloadable files.
+    // Only entries with size > 0 are actual downloadable files.
     let mut pending: Vec<(PathBuf, String)> = Vec::new(); // (dest, sha1)
     for obj in index.objects.values() {
-        if obj.size == 0 {
+        let hash = obj.hash.to_lowercase();
+        if obj.size == 0 || hash.len() < 2 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
             continue;
         }
-        let hash = obj.hash.clone();
-        if hash.len() < 2 {
-            continue;
-        }
-        let (ab, tail) = hash.split_at(2);
-        debug_assert_eq!(tail.len(), hash.len() - 2);
-        let dest = objects_dir.join(ab).join(&hash);
-        pending.push((dest, hash));
+        pending.push((objects_dir.join(&hash[..2]).join(&hash), hash));
     }
 
-    // 3. Download objects with progress
+    // 3. Download objects in parallel
+    set_file(prog, "assets");
     let total = pending.len() as u64;
-    let mut done: u64 = 0;
-    for (dest, hash) in pending {
-        done += 1;
-        set_file(prog, &dest.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default());
-        update_progress(prog, done, total);
-        let url = format!("https://resources.download.minecraft.net/{}/{}", &hash[..2], hash);
-        download::download_file(client, &url, &dest, Some(&hash)).map_err(|e| e.to_string())?;
+    update_progress(prog, 0, total);
+    let next = AtomicUsize::new(0);
+    let done = AtomicU64::new(0);
+    let failure: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..ASSET_WORKERS {
+            s.spawn(|| loop {
+                if failure.lock().map(|f| f.is_some()).unwrap_or(true) {
+                    break;
+                }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some((dest, hash)) = pending.get(i) else { break };
+                let url = format!("https://resources.download.minecraft.net/{}/{}", &hash[..2], hash);
+                match download::download_file_ex(client, &url, dest, Some(hash), cancel_flag(prog), None) {
+                    Ok(()) => update_progress(prog, done.fetch_add(1, Ordering::Relaxed) + 1, total),
+                    Err(e) => {
+                        if let Ok(mut f) = failure.lock() {
+                            f.get_or_insert(e);
+                        }
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    match failure.into_inner() {
+        Ok(Some(e)) => Err(e),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Meta parameters for a profile-json style loader (Fabric/Quilt).
@@ -242,7 +271,8 @@ const FABRIC: LoaderMeta = LoaderMeta { label: "Fabric", base: "https://meta.fab
 const QUILT: LoaderMeta = LoaderMeta { label: "Quilt", base: "https://meta.quiltmc.org/v3", };
 
 /// Install a profile-json based loader (Fabric or Quilt) for a given MC version.
-/// Returns the chosen loader version.
+/// A pinned `instance.loader_version` (e.g. from a modpack) is honoured,
+/// otherwise the newest loader is used. Returns the loader version.
 fn install_loader(
     client: &Client,
     root: &Path,
@@ -251,50 +281,39 @@ fn install_loader(
     prefix: &str,
     prog: Option<&Arc<InstallProgress>>,
 ) -> Result<String, String> {
-    set_file(prog, &format!("resolving {} versions", meta.label));
-    let loader_meta: serde_json::Value = download::get_json(
-        client,
-        &format!("{}/versions/loader/{}", meta.base, instance.game_version),
-    )
-    .map_err(|e| format!("{} meta for {}: {e}", meta.label, instance.game_version))?;
-    let latest = loader_meta
-        .as_array()
-        .and_then(|arr| arr.iter().find(|v| v.get("loader").is_some()))
-        .and_then(|v| v.get("loader").and_then(|l| l.get("version").and_then(|x| x.as_str())))
-        .unwrap_or("0.16.9")
-        .to_string();
+    let latest = if !instance.loader_version.is_empty() {
+        instance.loader_version.clone()
+    } else {
+        set_file(prog, &format!("resolving {} versions", meta.label));
+        let loader_meta: serde_json::Value = download::get_json(
+            client,
+            &format!("{}/versions/loader/{}", meta.base, instance.game_version),
+        )
+        .map_err(|e| format!("{} meta for {}: {e}", meta.label, instance.game_version))?;
+        loader_meta
+            .as_array()
+            .and_then(|arr| arr.iter().find(|v| v.get("loader").is_some()))
+            .and_then(|v| v.get("loader").and_then(|l| l.get("version").and_then(|x| x.as_str())))
+            .ok_or_else(|| format!("{} не поддерживает Minecraft {}", meta.label, instance.game_version))?
+            .to_string()
+    };
     set_file(prog, &format!("downloading {} loader {latest}", meta.label));
 
-    // Ensure base vanilla is present (client + libs + assets).
+    // Vanilla base (client + libs + assets + versions/<mc>.json for inheritsFrom).
     let mines = instance::instance_mines(root, &instance.name);
     std::fs::create_dir_all(&mines).map_err(|e| e.to_string())?;
-    {
-        let manifest = mojang::fetch_manifest(client).map_err(|e| e.to_string())?;
-        let base_entry = mojang::find_version(&manifest, &instance.game_version)
-            .ok_or_else(|| format!("MC {} not in manifest", instance.game_version))?;
-        let base_vjson = mojang::fetch_version_json(client, &base_entry).map_err(|e| e.to_string())?;
-        download_version_files(client, &mines, &base_vjson, prog)?;
-    }
+    install_base(client, &mines, &instance.game_version, prog)?;
 
-    // Fetch the loader profile json (libraries + main class) and install its
-    // libraries. Write the version json under a loader-version based name so it
-    // never collides with the vanilla json id.
+    // Loader profile json (libraries + main class + inheritsFrom).
     let profile_url =
         format!("{}/versions/loader/{}/{}/profile/json", meta.base, instance.game_version, latest);
-    let vjson_text = download::get_text(client, &profile_url).map_err(|e| e.to_string())?;
+    let vjson_text = download::get_text(client, &profile_url)?;
     let modded: mojang::VersionJson = serde_json::from_str(&vjson_text).map_err(|e| format!("parse {} json: {e}", meta.label))?;
-
     download_version_files(client, &mines, &modded, prog)?;
 
-    // Save the loader json under a deterministic name.
-    let json_name = if instance.loader_version.is_empty() {
-        format!("{prefix}-{latest}.json")
-    } else {
-        format!("{}.json", instance.loader_version)
-    };
-    let version_dir = mines.join("versions");
-    let _ = std::fs::create_dir_all(&version_dir);
-    std::fs::write(version_dir.join(&json_name), &vjson_text).map_err(|e| format!("Cannot write {}: {e}", json_name))?;
+    // Same name as `install_instance` records in `version_name`.
+    let json_name = format!("{prefix}-{latest}");
+    write_version_json(&mines, &json_name, &vjson_text)?;
     set_file(prog, &format!("{} {latest} installed", meta.label));
 
     Ok(latest)
@@ -310,53 +329,18 @@ pub fn install_quilt(client: &Client, root: &Path, instance: &Instance, prog: Op
     install_loader(client, root, instance, &QUILT, "quilt-loader", prog)
 }
 
-/// Скачать installer-джару модового лоадера и прочитать из неё `version.json`
-/// (профиль лоадера: libraries + mainClass), не распаковывая остальное.
-///
-/// Файл качается в ПАПКУ ИНСТАНСА (пользовательская директория с правами
-/// записи), а не в системный temp — это устраняет PermissionDenied на
-/// системах с ограниченным доступом к `TMP` и гарантирует, что распаковка
-/// происходит из места, куда мы точно можем писать.
-fn download_fm_installer_version_json(
-    client: &Client,
-    inst_dir: &Path,
-    url: &str,
-    prog: Option<&Arc<InstallProgress>>,
-) -> Result<String, String> {
-    set_file(prog, "downloading loader installer");
-    let tmp_root = inst_dir.join(".tmp");
-    std::fs::create_dir_all(&tmp_root)
-        .map_err(|e| format!("Cannot create {}: {e}", tmp_root.display()))?;
-    let tmp = tmp_root.join(format!("installer-{}.jar", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
-
-    download::download_file_with_progress(client, url, &tmp, None).map_err(|e| format!("installer download: {e}"))?;
-    download::set_executable(&tmp)?;
-
-    // Закрываем все дескрипторы ДО удаления временного файла (на Windows
-    // открытый `File`/`ZipArchive` блокирует remove_file).
-    let result = (|| {
-        let file = std::fs::File::open(&tmp).map_err(|e| format!("open installer: {e}"))?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("installer not a zip: {e}"))?;
-        let mut found: Option<String> = None;
-        for i in 0..archive.len() {
-            let mut entry = archive
-                .by_index(i)
-                .map_err(|e| format!("read installer entry #{i}: {e}"))?;
-            if entry.name() == "version.json" {
-                let mut text = String::new();
-                use std::io::Read;
-                entry.read_to_string(&mut text).map_err(|e| format!("read version.json: {e}"))?;
-                found = Some(text);
-                break;
-            }
-        }
-        // явно дропаем архив до выхода из замыкания
-        drop(archive);
-        found.ok_or_else(|| "version.json not found in installer".to_string())
-    })();
-    let _ = std::fs::remove_file(&tmp);
-    result
+/// Скачать installer-джару модового лоадера в `dest` и прочитать из неё
+/// `version.json` (профиль лоадера: id + libraries + mainClass).
+fn read_installer_profile(jar: &Path) -> Result<String, String> {
+    let file = std::fs::File::open(jar).map_err(|e| format!("open installer: {e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("installer not a zip: {e}"))?;
+    let mut entry = archive
+        .by_name("version.json")
+        .map_err(|_| "version.json not found in installer".to_string())?;
+    let mut text = String::new();
+    use std::io::Read;
+    entry.read_to_string(&mut text).map_err(|e| format!("read version.json: {e}"))?;
+    Ok(text)
 }
 
 /// Forge: резолв версии лоадера для `mc` по promotions (latest → recommended).
@@ -427,11 +411,9 @@ fn vers_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
-/// Общая реализация установки Forge/NeoForge:
-///  1) скачиваем installer-джару, читаем из неё version.json (профиль);
-///  2) ставим vanilla-основу (client + libs + assets);
-///  3) качаем библиотеки профиля, пишем `versions/<id>.json`;
-/// Возвращает идентификатор версии лоадера (например "1.21.1-52.1.20" или "21.1.243").
+/// Общая реализация установки Forge/NeoForge: скачиваем installer и запускаем
+/// его (`--installClient`), чтобы он выполнил процессоры (патч клиента,
+/// генерация mappings и т.д.). Возвращает id профиля лоадера.
 fn install_fm_installer(
     client: &Client,
     root: &Path,
@@ -441,69 +423,140 @@ fn install_fm_installer(
     installer_url: &str,
     prog: Option<&Arc<InstallProgress>>,
 ) -> Result<String, String> {
-    set_file(prog, &format!("downloading {label} {}", full_loader_version));
+    set_file(prog, &format!("downloading {label} {full_loader_version}"));
     let mines = instance::instance_mines(root, &instance.name);
     std::fs::create_dir_all(&mines).map_err(|e| format!("Cannot create {}: {e}", mines.display()))?;
-    let vjson_text = download_fm_installer_version_json(client, &mines, installer_url, prog)?;
-    let profile: mojang::VersionJson = serde_json::from_str(&vjson_text).map_err(|e| format!("parse {label} json: {e}"))?;
-    let profile_id = profile.id.clone();
 
-    // 1) vanilla-основа
-    let manifest = mojang::fetch_manifest(client).map_err(|e| e.to_string())?;
-    let base_entry = mojang::find_version(&manifest, &instance.game_version)
-        .ok_or_else(|| format!("MC {} not in manifest", instance.game_version))?;
-    let base_vjson = mojang::fetch_version_json(client, &base_entry).map_err(|e| e.to_string())?;
-    download_version_files(client, &mines, &base_vjson, prog)?;
+    // Installer лежит в папке инстанса (там точно есть права записи).
+    let tmp_root = mines.join(".tmp");
+    std::fs::create_dir_all(&tmp_root).map_err(|e| format!("Cannot create {}: {e}", tmp_root.display()))?;
+    let installer = tmp_root.join(format!("installer-{}.jar", std::process::id()));
+    let result = (|| -> Result<String, String> {
+        // the installer runs as Java code on this computer: never run an unverified one
+        let sha1 = download::maven_sha1(client, installer_url)
+            .map_err(|e| format!("{label}: не удалось получить контрольную сумму установщика ({e}) — установка остановлена"))?;
+        download::download_file_ex(client, installer_url, &installer, Some(&sha1), cancel_flag(prog), None)
+            .map_err(|e| format!("installer download: {e}"))?;
+        let profile_text = read_installer_profile(&installer)?;
+        let profile: mojang::VersionJson =
+            serde_json::from_str(&profile_text).map_err(|e| format!("parse {label} json: {e}"))?;
+        let profile_id = profile.id.clone();
 
-    // 2) библиотеки профайла лоадера
-    download_version_files(client, &mines, &profile, prog)?;
+        // vanilla-основа (клиент, библиотеки, ассеты, versions/<mc>.json)
+        let base = install_base(client, &mines, &instance.game_version, prog)?;
 
-    // 3) пишем json под id профайла (совпадает с `version_name`)
-    let version_dir = mines.join("versions");
-    let _ = std::fs::create_dir_all(&version_dir);
-    let json_path = version_dir.join(format!("{profile_id}.json"));
-    if !json_path.exists() {
-        std::fs::write(&json_path, &vjson_text).map_err(|e| format!("Cannot write {}: {e}", json_path.display()))?;
+        // Installer требует launcher_profiles.json в целевой папке.
+        let lp = mines.join("launcher_profiles.json");
+        if !lp.exists() {
+            std::fs::write(&lp, r#"{"profiles":{},"version":3}"#).map_err(|e| format!("write launcher_profiles.json: {e}"))?;
+        }
+
+        set_file(prog, &format!("running {label} installer (this takes a while)"));
+        let required = base.java_version.as_ref().map(|j| j.major_version);
+        let java = ensure_java(client, root, required.unwrap_or(17), prog)?;
+        run_installer(&java, &installer, &mines, prog)?;
+
+        // Installer пишет versions/<id>/<id>.json; подтягиваем недостающие библиотеки.
+        let nested = mines.join("versions").join(&profile_id).join(format!("{profile_id}.json"));
+        let installed: mojang::VersionJson = match std::fs::read_to_string(&nested) {
+            Ok(t) => serde_json::from_str(&t).map_err(|e| format!("parse installed {label} json: {e}"))?,
+            Err(_) => {
+                write_version_json(&mines, &profile_id, &profile_text)?;
+                profile
+            }
+        };
+        download_version_files(client, &mines, &installed, prog)?;
+        set_file(prog, &format!("{label} {full_loader_version} installed"));
+        Ok(profile_id)
+    })();
+    let _ = std::fs::remove_file(&installer);
+    let _ = std::fs::remove_dir(&tmp_root);
+    result
+}
+
+/// `java -jar installer --installClient <dir>` with cancel support; output
+/// goes to `installer.log` next to the game files.
+fn run_installer(java: &Path, installer: &Path, mines: &Path, prog: Option<&Arc<InstallProgress>>) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    let log_path = mines.join("installer.log");
+    let log = std::fs::File::create(&log_path).map_err(|e| format!("create {}: {e}", log_path.display()))?;
+    let mut cmd = Command::new(java);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // no extra console window
     }
-    set_file(prog, &format!("{label} {} installed", full_loader_version));
-    Ok(profile_id)
+    // the system temp folder may be closed to programs: work inside the game folder
+    let tmp = installer.parent().unwrap_or(mines).to_path_buf();
+    let mut child = cmd
+        .env("TMP", &tmp)
+        .env("TEMP", &tmp)
+        .arg(format!("-Djava.io.tmpdir={}", tmp.display()))
+        .arg("-jar")
+        .arg(installer)
+        .arg("--installClient")
+        .arg(mines)
+        .current_dir(mines)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .map_err(|e| format!("cannot start installer: {e}"))?;
+    loop {
+        if check_cancel(prog).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Cancelled".to_string());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+                let tail: Vec<&str> = log.lines().rev().take(8).collect();
+                let tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+                return Err(format!("installer завершился с ошибкой ({status}); см. installer.log\n{tail}"));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(250)),
+            Err(e) => return Err(format!("installer: {e}")),
+        }
+    }
 }
 
 /// Установить Forge для инстанса. `instance.loader_version` (если задан) —
 /// полная версия вида `1.21.1-52.1.20`, иначе резолвится latest.
 pub fn install_forge(client: &Client, root: &Path, instance: &Instance, prog: Option<&Arc<InstallProgress>>) -> Result<String, String> {
-    if !instance.loader_version.is_empty() {
-        let full = instance.loader_version.clone();
-        let url = format!(
-            "https://maven.minecraftforge.net/net/minecraftforge/forge/{full}/forge-{full}-installer.jar"
-        );
-        return install_fm_installer(client, root, instance, "Forge", &full, &url, prog);
-    }
-    let fv = resolve_forge_version(client, &instance.game_version, prog)?;
-    let full = format!("{}-{}", instance.game_version, fv);
-    let url = format!(
-        "https://maven.minecraftforge.net/net/minecraftforge/forge/{full}/forge-{full}-installer.jar"
-    );
+    let full = if !instance.loader_version.is_empty() {
+        instance.loader_version.clone()
+    } else {
+        let fv = resolve_forge_version(client, &instance.game_version, prog)?;
+        format!("{}-{}", instance.game_version, fv)
+    };
+    let url = format!("https://maven.minecraftforge.net/net/minecraftforge/forge/{full}/forge-{full}-installer.jar");
     install_fm_installer(client, root, instance, "Forge", &full, &url, prog)
 }
 
 /// Установить NeoForge для инстанса.
 pub fn install_neoforge(client: &Client, root: &Path, instance: &Instance, prog: Option<&Arc<InstallProgress>>) -> Result<String, String> {
-    if !instance.loader_version.is_empty() {
-        let full = instance.loader_version.clone();
-        let url = format!(
-            "https://maven.neoforged.net/releases/net/neoforged/neoforge/{full}/neoforge-{full}-installer.jar"
-        );
-        return install_fm_installer(client, root, instance, "NeoForge", &full, &url, prog);
-    }
-    let ver = resolve_neoforge_version(client, &instance.game_version, prog)?;
-    let url = format!(
-        "https://maven.neoforged.net/releases/net/neoforged/neoforge/{ver}/neoforge-{ver}-installer.jar"
-    );
+    let ver = if !instance.loader_version.is_empty() {
+        instance.loader_version.clone()
+    } else {
+        resolve_neoforge_version(client, &instance.game_version, prog)?
+    };
+    let url = format!("https://maven.neoforged.net/releases/net/neoforged/neoforge/{ver}/neoforge-{ver}-installer.jar");
     install_fm_installer(client, root, instance, "NeoForge", &ver, &url, prog)
 }
 
-/// Install an instance's base (vanilla or Fabric) and return the resolved
+/// File name (inside `versions/`) of an installed loader profile: the
+/// Forge/NeoForge installers use `<id>/<id>.json`, ours are flat.
+fn profile_file_name(mines: &Path, id: &str) -> String {
+    if mines.join("versions").join(id).join(format!("{id}.json")).exists() {
+        format!("{id}/{id}.json")
+    } else {
+        format!("{id}.json")
+    }
+}
+
+/// Install an instance's base (vanilla or loader) and return the resolved
 /// instance with `version_name`/`loader_version` filled in.
 pub fn install_instance(
     client: &Client,
@@ -512,6 +565,7 @@ pub fn install_instance(
     prog: Option<&Arc<InstallProgress>>,
 ) -> Result<Instance, String> {
     let mut inst = instance.clone();
+    let mines = instance::instance_mines(root, &inst.name);
     match inst.loader.as_str() {
         "fabric" => {
             let lv = install_fabric(client, root, &inst, prog)?;
@@ -523,15 +577,17 @@ pub fn install_instance(
             inst.loader_version = lv.clone();
             inst.version_name = Some(format!("quilt-loader-{lv}.json"));
         }
-        "forge" => {
-            let profile_id = install_forge(client, root, &inst, prog)?;
-            inst.loader_version = profile_id.clone();
-            inst.version_name = Some(format!("{profile_id}.json")); // "1.21.1-forge-52.1.20.json"
-        }
-        "neoforge" => {
-            let profile_id = install_neoforge(client, root, &inst, prog)?;
-            inst.loader_version = profile_id.clone();
-            inst.version_name = Some(format!("{profile_id}.json")); // "neoforge-21.1.243.json"
+        "forge" | "neoforge" => {
+            let profile_id = if inst.loader == "forge" {
+                install_forge(client, root, &inst, prog)?
+            } else {
+                install_neoforge(client, root, &inst, prog)?
+            };
+            inst.version_name = Some(profile_file_name(&mines, &profile_id));
+            // keep the installer-style version (e.g. "1.21.1-52.1.20") for reinstalls
+            if inst.loader_version.is_empty() {
+                inst.loader_version = profile_id;
+            }
         }
         _ => {
             install_vanilla(client, root, &inst.name, &inst.game_version, prog)?;
@@ -544,113 +600,161 @@ pub fn install_instance(
 }
 
 /// Install a Modrinth modpack (.mrpack) into instance: download archive, extract,
-/// install dependencies (fabric loader / neoforge / forge), unpack overrides.
+/// install dependencies (loader), download files (hash-checked), apply overrides.
 /// Returns the fully-resolved instance (game_version + loader fields filled in).
 pub fn install_mrpack(
     client: &Client,
     root: &Path,
     instance: &Instance,
-    url: &str,
+    pack: &modrinth::MrpackFile,
     prog: Option<&Arc<InstallProgress>>,
 ) -> Result<Instance, String> {
-    // create instance dirs
+    install_mrpack_from(client, root, instance, PackSource::Remote(pack), prog)
+}
+
+/// Install a `.mrpack` the user already has on disk. The archive itself has no
+/// checksum to compare with, but every file it lists is still hash-checked.
+pub fn install_mrpack_file(
+    client: &Client,
+    root: &Path,
+    instance: &Instance,
+    file: &Path,
+    prog: Option<&Arc<InstallProgress>>,
+) -> Result<Instance, String> {
+    install_mrpack_from(client, root, instance, PackSource::Local(file), prog)
+}
+
+enum PackSource<'a> {
+    Remote(&'a modrinth::MrpackFile),
+    Local(&'a Path),
+}
+
+fn install_mrpack_from(
+    client: &Client,
+    root: &Path,
+    instance: &Instance,
+    source: PackSource,
+    prog: Option<&Arc<InstallProgress>>,
+) -> Result<Instance, String> {
     let inst_dir = instance::prepare_instance_dir(instance, root)?;
     let pack_dir = inst_dir.join("pack-tmp");
+    let _ = std::fs::remove_dir_all(&pack_dir);
     let _ = std::fs::create_dir_all(&pack_dir);
+    let result = install_mrpack_inner(client, root, instance, source, &inst_dir, &pack_dir, prog);
+    let _ = std::fs::remove_dir_all(&pack_dir);
+    result
+}
 
+fn install_mrpack_inner(
+    client: &Client,
+    root: &Path,
+    instance: &Instance,
+    source: PackSource,
+    inst_dir: &Path,
+    pack_dir: &Path,
+    prog: Option<&Arc<InstallProgress>>,
+) -> Result<Instance, String> {
     let pack_file = pack_dir.join("modpack.mrpack");
-    set_file(prog, "downloading modpack");
-    { let _ = std::fs::remove_file(&pack_file); }
-    download::download_file_with_progress(client, url, &pack_file, None).map_err(|e| e.to_string())?;
+    match source {
+        PackSource::Remote(pack) => {
+            set_file(prog, "downloading modpack");
+            if pack.sha1.is_none() && pack.sha512.is_none() {
+                return Err("у модпака нет контрольной суммы — установка остановлена".into());
+            }
+            download::download_file_ex(client, &pack.url, &pack_file, pack.sha1.as_deref(), cancel_flag(prog), None)?;
+            if let Some(expected) = &pack.sha512 {
+                if &download::file_sha512(&pack_file)? != expected {
+                    return Err("модпак: SHA-512 не совпал — файл повреждён или подменён".into());
+                }
+            }
+        }
+        PackSource::Local(path) => {
+            set_file(prog, "reading modpack");
+            std::fs::copy(path, &pack_file).map_err(|e| format!("не удалось прочитать {}: {e}", path.display()))?;
+        }
+    }
 
     set_file(prog, "extracting modpack");
-    let index = modrinth::extract_mrpack(&pack_file, &pack_dir)?;
-
+    let extract_dir = pack_dir.join("x");
+    let index = modrinth::extract_mrpack(&pack_file, &extract_dir)?;
     let installed_version = index.version_id.clone().unwrap_or_else(|| "unknown".into());
 
+    // dependencies: Minecraft + loader (with the pack's pinned loader version)
     let mut pack_mc: Option<String> = None;
     let mut pack_loader: Option<String> = None;
-    let mut pack_loader_kind: String = String::new();
-
-    // dependencies: Minecraft + loader
+    let mut pack_loader_kind = String::new();
+    let mut pack_loader_version = String::new();
     if let Some(deps) = &index.dependencies {
-        if let Some(mc) = deps.get("minecraft") {
-            pack_mc = Some(mc.clone());
-        }
-        // detect loader
-        for loader in ["quilt-loader", "neoforge", "forge", "fabric-loader"] {
-            if let Some(lv) = deps.get(loader) {
-                let loader_kind = match loader {
-                    "fabric-loader" => "fabric",
-                    "quilt-loader" => "quilt",
-                    "neoforge" => "neoforge",
-                    "forge" => "forge",
-                    _ => "fabric",
-                };
-                pack_loader = Some(format!("{loader_kind}@{lv}"));
-                pack_loader_kind = loader_kind.to_string();
+        pack_mc = deps.get("minecraft").cloned();
+        for (key, kind) in [("quilt-loader", "quilt"), ("neoforge", "neoforge"), ("forge", "forge"), ("fabric-loader", "fabric")] {
+            if let Some(lv) = deps.get(key) {
+                pack_loader = Some(format!("{kind}@{lv}"));
+                pack_loader_kind = kind.to_string();
+                pack_loader_version = lv.clone();
+                break;
             }
         }
     }
 
-    // Build the instance: install base MC + loader so the pack is runnable.
     let mut resolved = instance.clone();
-    resolved.game_version = if let Some(mc) = pack_mc.as_ref() { mc.clone() } else { instance.game_version.clone() };
-    resolved.loader = if pack_loader_kind.is_empty() {
-        instance.loader.clone()
-    } else {
-        pack_loader_kind.clone()
-    };
+    if let Some(mc) = &pack_mc {
+        resolved.game_version = mc.clone();
+    }
+    if !pack_loader_kind.is_empty() {
+        resolved.loader = pack_loader_kind.clone();
+        resolved.loader_version = match pack_loader_kind.as_str() {
+            // Forge versions are installed as "<mc>-<forge>"
+            "forge" if !pack_loader_version.contains('-') => format!("{}-{}", resolved.game_version, pack_loader_version),
+            _ => pack_loader_version.clone(),
+        };
+    }
 
     let resolved = if !resolved.game_version.is_empty() && resolved.game_version != "latest" {
         set_file(prog, &format!("installing Minecraft {}", resolved.game_version));
         install_instance(client, root, &resolved, prog)?
     } else {
-        set_file(prog, "modpack without pinned MC — skipping base install");
         let mut updated = resolved;
         updated.loader_version = String::new();
         updated.version_name = None;
         updated
     };
 
-    let resolved_inst = resolved;
-
-    // Download files listed in index into instance `mines/mods` (jar) or other paths.
+    // Download files listed in the index (client-side only, hash-checked).
     set_file(prog, "downloading modpack files");
-    let total = index.files.len() as u64;
-    let mut done: u64 = 0;
-    for f in &index.files {
-        done += 1;
+    let mines = inst_dir.join("mines");
+    let files: Vec<&modrinth::IndexFile> = index.files.iter().filter(|f| f.client_supported()).collect();
+    let total = files.len() as u64;
+    for (i, f) in files.iter().enumerate() {
+        check_cancel(prog)?;
         set_file(prog, &f.path);
-        update_progress(prog, done, total);
-        let dest = inst_dir.join("mines").join(&f.path);
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        // verify existing hash
+        update_progress(prog, i as u64 + 1, total);
+        let dest = instance::safe_join(&mines, &f.path)?;
         let sha1 = f.hashes.get("sha1").map(|h| h.to_lowercase());
-        if let Some(h) = &sha1 {
-            if dest.exists() && download::file_sha1(&dest).map(|x| x.to_lowercase()) == Ok(h.clone()) {
-                continue;
+        let sha512 = f.hashes.get("sha512").map(|h| h.to_lowercase());
+        if sha1.is_none() && sha512.is_none() {
+            return Err(format!("у файла {} нет хэша — отказ от установки", f.path));
+        }
+        let url = f
+            .downloads
+            .iter()
+            .find(|u| modrinth::is_allowed_download_url(u))
+            .ok_or_else(|| format!("у файла {} нет допустимого источника загрузки", f.path))?;
+        download::download_file_ex(client, url, &dest, sha1.as_deref(), cancel_flag(prog), None)?;
+        if let Some(expected) = &sha512 {
+            let actual = download::file_sha512(&dest)?;
+            if &actual != expected {
+                let _ = std::fs::remove_file(&dest);
+                return Err(format!("sha512 mismatch for {}", f.path));
             }
         }
-        let url = f.downloads.first().cloned().unwrap_or_default();
-        if url.is_empty() {
-            continue;
-        }
-        download::download_file_with_progress(client, &url, &dest, None).map_err(|e| e.to_string())?;
     }
 
-    // overrides are already extracted to pack_dir/overrides; copy into instance
+    // overrides, then client-only overrides on top
     set_file(prog, "applying overrides");
-    let overrides_src = pack_dir.join("overrides");
-    if overrides_src.exists() {
-        copy_dir(&overrides_src, &inst_dir.join("mines"))?;
+    for dir in ["overrides", "client-overrides"] {
+        copy_dir(&extract_dir.join(dir), &mines)?;
     }
 
-    let _ = std::fs::remove_dir_all(&pack_dir);
-    // store pack metadata marker
-    let marker = inst_dir.join("pack.json");
     let meta = serde_json::json!({
         "modpack": index.name,
         "files": index.files.len(),
@@ -658,9 +762,8 @@ pub fn install_mrpack(
         "loader": pack_loader,
         "version_id": installed_version,
     });
-    std::fs::create_dir_all(&inst_dir).map_err(|e| e.to_string())?;
-    let _ = std::fs::write(marker, serde_json::to_string_pretty(&meta).unwrap_or_default());
-    Ok(resolved_inst)
+    let _ = std::fs::write(inst_dir.join("pack.json"), serde_json::to_string_pretty(&meta).unwrap_or_default());
+    Ok(resolved)
 }
 
 /// Simple recursive copy (src -> dst).
@@ -683,85 +786,129 @@ pub fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Download a single mod version's primary file into instance mods dir.
-pub fn download_mod_version(
-    client: &Client,
-    root: &Path,
-    instance_name: &str,
-    version: &modrinth::Version,
-    prog: Option<&Arc<InstallProgress>>,
-) -> Result<PathBuf, String> {
-    let inst_dir = instance::instance_dir(root, instance_name);
-    let mods_dir = inst_dir.join("mines/mods");
-    std::fs::create_dir_all(&mods_dir).map_err(|e| e.to_string())?;
-    let primary = version
-        .files
-        .iter()
-        .find(|f| f.primary.unwrap_or(false))
-        .or_else(|| version.files.first())
-        .ok_or("No files in this version")?;
-    let dest = mods_dir.join(&primary.filename);
-    set_file(prog, &primary.filename);
-    let sha1 = primary.hashes.get("sha1").map(|h| h.to_lowercase());
-    download::download_file(client, &primary.url, &dest, sha1.as_deref()).map_err(|e| e.to_string())?;
-    Ok(dest)
-}
-
-/// Download dependencies of a version (direct required/optional) into mods dir.
-pub fn download_mod_dependencies(
-    client: &Client,
-    root: &Path,
-    instance_name: &str,
-    version: &modrinth::Version,
-    prog: Option<&Arc<InstallProgress>>,
-) -> Result<usize, String> {
-    let mut downloaded: usize = 0;
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut queue: Vec<String> = Vec::new();
-    for dep in &version.dependencies {
-        if let Some(pid) = &dep.project_id {
-            if dep.dependency_type.as_deref() == Some("required") || dep.dependency_type.is_none() {
-                if seen.insert(pid.clone()) {
-                    queue.push(pid.clone());
-                }
-            }
-        }
-    }
-    while let Some(pid) = queue.pop() {
-        let versions = modrinth::get_project_versions(client, &pid).map_err(|e| e.to_string())?;
-        if let Some(latest) = versions.first() {
-            let inst_dir = instance::instance_dir(root, instance_name);
-            let mods_dir = inst_dir.join("mines/mods");
-            let primary = latest
-                .files
-                .iter()
-                .find(|f| f.primary.unwrap_or(false))
-                .or_else(|| latest.files.first());
-            if let Some(f) = primary {
-                let dest = mods_dir.join(&f.filename);
-                let sha1 = f.hashes.get("sha1").map(|h| h.to_lowercase());
-                set_file(prog, &f.filename);
-                if !dest.exists() {
-                    download::download_file(client, &f.url, &dest, sha1.as_deref()).map_err(|e| e.to_string())?;
-                    downloaded += 1;
-                }
-                // enqueue nested deps
-                for dep in &latest.dependencies {
-                    if let Some(pid2) = &dep.project_id {
-                        if dep.dependency_type.as_deref() == Some("required") && seen.insert(pid2.clone()) {
-                            queue.push(pid2.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(downloaded)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testsupport::{Mock, route};
+
+    #[test]
+    fn maven_checksum_is_required_and_parsed() {
+        let m = Mock::start();
+        let c = Client::new();
+        m.set(vec![route("/a.jar.sha1", 200, "FA4F90047C23E6DF4D2B4E649AEC7FD5D1E20ACD  a.jar\n")]);
+        assert_eq!(download::maven_sha1(&c, &format!("{}/a.jar", m.url())).unwrap(), "fa4f90047c23e6df4d2b4e649aec7fd5d1e20acd");
+        m.set(vec![route("/a.jar.sha1", 200, "<html>not found</html>")]);
+        assert!(download::maven_sha1(&c, &format!("{}/a.jar", m.url())).is_err());
+        m.set(vec![]);
+        assert!(download::maven_sha1(&c, &format!("{}/a.jar", m.url())).is_err());
+    }
+
+    /// A tiny "JRE" archive: <top>/bin/java.exe
+    fn fake_jre_zip() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = zip::ZipWriter::new(&mut buf);
+            let opts: zip::write::SimpleFileOptions = Default::default();
+            z.start_file("jdk-99-jre/bin/java.exe", opts).unwrap();
+            std::io::Write::write_all(&mut z, b"MZ fake").unwrap();
+            z.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    #[test]
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fn java_download_is_verified_by_sha256() {
+        use sha2::{Digest, Sha256};
+        let m = Mock::start();
+        let zip = fake_jre_zip();
+        let good = hex::encode(Sha256::digest(&zip));
+        let root = std::env::temp_dir().join(format!("lc-jre-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // SAFETY: only this test reads the variable
+        unsafe { std::env::set_var("LIMECRAFT_ADOPTIUM_API", m.url()) };
+        let c = Client::new();
+        let asset = |sha: &str| format!(r#"[{{"binary":{{"package":{{"link":"{}/jre.zip","checksum":"{sha}","size":1}}}}}}]"#, m.url());
+
+        // a tampered archive is refused and not unpacked
+        m.set(vec![route("/assets/latest/99/", 200, asset(&"0".repeat(64))), route("/jre.zip", 200, zip.clone())]);
+        let err = ensure_java(&c, &root, 99, None).unwrap_err();
+        assert!(err.contains("SHA-256"), "{err}");
+        assert!(!root.join("runtime/java-99").exists());
+
+        // the genuine one is installed
+        m.set(vec![route("/assets/latest/99/", 200, asset(&good)), route("/jre.zip", 200, zip)]);
+        let exe = ensure_java(&c, &root, 99, None).unwrap();
+        assert!(exe.ends_with("java-99/bin/java.exe") && exe.exists(), "{}", exe.display());
+        let _ = std::fs::remove_dir_all(&root);
+        unsafe { std::env::remove_var("LIMECRAFT_ADOPTIUM_API") };
+    }
+
+    fn jre_tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("lc-jre-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A .tar.gz with the given (path, bytes) files.
+    fn make_targz(path: &Path, files: &[(&str, &[u8])]) {
+        let gz = flate2::write::GzEncoder::new(std::fs::File::create(path).unwrap(), flate2::Compression::fast());
+        let mut tar = tar::Builder::new(gz);
+        for (name, data) in files {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            // (a raw header so that even "../" names can be written)
+            let mut raw = h.clone();
+            raw.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+            raw.set_cksum();
+            tar.append(&raw, *data).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+
+    #[test]
+    fn a_linux_jre_archive_is_unpacked_without_its_top_folder() {
+        let d = jre_tmp("ok");
+        let ar = d.join("jre.tar.gz");
+        make_targz(&ar, &[("jdk-25+9-jre/bin/java", b"ELF-java"), ("jdk-25+9-jre/lib/modules", b"mods")]);
+        let out = d.join("out");
+        unpack_jre(&ar, &out).unwrap();
+        assert_eq!(std::fs::read(out.join("bin/java")).unwrap(), b"ELF-java");
+        assert_eq!(std::fs::read(out.join("lib/modules")).unwrap(), b"mods");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(std::fs::metadata(out.join("bin/java")).unwrap().permissions().mode() & 0o100 != 0, "java must be executable");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_jre_archive_cannot_write_outside_its_folder() {
+        let d = jre_tmp("evil");
+        let ar = d.join("evil.tar.gz");
+        make_targz(&ar, &[("top/../../escape.txt", b"x")]);
+        let out = d.join("out");
+        assert!(unpack_jre(&ar, &out).is_err());
+        assert!(!d.join("escape.txt").exists() && !d.parent().unwrap().join("escape.txt").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_right_jre_is_asked_for_on_this_system() {
+        let m = Mock::start();
+        let sha = "ab".repeat(32);
+        let reply = |link: &str| format!(r#"[{{"binary":{{"package":{{"link":"{link}","checksum":"{sha}","size":1}}}}}}]"#);
+        let c = Client::new();
+        m.set(vec![route("/assets/latest/21/", 200, reply("https://x/jre.tar.gz"))]);
+        assert!(adoptium_jre_at(&m.url(), &c, 21, ("linux", "x64", ".tar.gz")).is_ok());
+        assert!(adoptium_jre_at(&m.url(), &c, 21, ("windows", "x64", ".zip")).unwrap_err().contains("формат"), "a tar.gz is not what Windows wants");
+        let asked = m.requests().join(" ");
+        assert!(asked.contains("os=linux") && asked.contains("architecture=x64"), "{asked}");
+    }
 
     #[test]
     fn version_ordering() {
@@ -805,4 +952,187 @@ mod tests {
             "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.243/neoforge-21.1.243-installer.jar"
         );
     }
+}
+
+fn adoptium_base() -> String {
+    std::env::var("LIMECRAFT_ADOPTIUM_API")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "https://api.adoptium.net/v3".to_string())
+}
+
+/// What Adoptium offers for this computer: (os, architecture, archive ending).
+fn adoptium_platform() -> Option<(&'static str, &'static str, &'static str)> {
+    if cfg!(all(windows, target_arch = "x86_64")) {
+        Some(("windows", "x64", ".zip"))
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some(("linux", "x64", ".tar.gz"))
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Some(("linux", "aarch64", ".tar.gz"))
+    } else {
+        None
+    }
+}
+
+fn java_file_name() -> &'static str {
+    if cfg!(windows) { "java.exe" } else { "java" }
+}
+
+/// Download link + SHA-256 of the newest Temurin JRE for this computer.
+fn adoptium_jre(client: &Client, major: u32, platform: (&str, &str, &str)) -> Result<(String, String), String> {
+    adoptium_jre_at(&adoptium_base(), client, major, platform)
+}
+
+fn adoptium_jre_at(api: &str, client: &Client, major: u32, platform: (&str, &str, &str)) -> Result<(String, String), String> {
+    let (os, arch, ending) = platform;
+    let url = format!("{api}/assets/latest/{major}/hotspot?architecture={arch}&image_type=jre&os={os}&vendor=eclipse");
+    let v: serde_json::Value = download::get_json(client, &url)?;
+    let pkg = v
+        .get(0)
+        .and_then(|a| a.get("binary"))
+        .and_then(|b| b.get("package"))
+        .ok_or_else(|| format!("Adoptium: нет сборки Java {major} для {os} {arch}"))?;
+    let link = pkg.get("link").and_then(|l| l.as_str()).ok_or("Adoptium: нет ссылки на архив")?;
+    let sha = pkg.get("checksum").and_then(|c| c.as_str()).ok_or("Adoptium: нет контрольной суммы")?;
+    if !link.ends_with(ending) {
+        return Err(format!("Adoptium: неожиданный формат архива: {link}"));
+    }
+    if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Adoptium: неверная контрольная сумма".into());
+    }
+    Ok((link.to_string(), sha.to_lowercase()))
+}
+
+/// Unpack a JRE archive (`.zip` or `.tar.gz`) into `dest`, dropping its single
+/// top-level folder. Entries that try to leave `dest` are refused; links are skipped.
+fn unpack_jre(archive: &Path, dest: &Path) -> Result<(), String> {
+    // "jdk-21.0.5+11-jre/bin/java" -> "bin/java"; None for the folder itself or an unsafe path
+    fn inside(rel: &Path) -> Result<Option<PathBuf>, String> {
+        let mut out = PathBuf::new();
+        for (i, c) in rel.components().enumerate() {
+            match c {
+                std::path::Component::Normal(p) => {
+                    if i > 0 {
+                        out.push(p);
+                    }
+                }
+                std::path::Component::CurDir => {}
+                _ => return Err(format!("в архиве Java небезопасный путь: {}", rel.display())),
+            }
+        }
+        Ok(Some(out).filter(|p| !p.as_os_str().is_empty()))
+    }
+    let name = archive.to_string_lossy().to_lowercase();
+    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        let file = std::fs::File::open(archive).map_err(|e| format!("open {}: {e}", archive.display()))?;
+        let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+        for entry in tar.entries().map_err(|e| format!("bad JRE archive: {e}"))? {
+            let mut entry = entry.map_err(|e| format!("bad JRE archive: {e}"))?;
+            let kind = entry.header().entry_type();
+            if !(kind.is_file() || kind.is_dir()) {
+                continue; // links, devices
+            }
+            let rel = entry.path().map_err(|e| e.to_string())?.into_owned();
+            let Some(rel) = inside(&rel)? else { continue };
+            let out = dest.join(rel);
+            if kind.is_dir() {
+                std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+                continue;
+            }
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mode = entry.header().mode().unwrap_or(0o644);
+            let mut f = std::fs::File::create(&out).map_err(|e| format!("write {}: {e}", out.display()))?;
+            std::io::copy(&mut entry, &mut f).map_err(|e| e.to_string())?;
+            drop(f);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode | 0o600));
+            }
+            #[cfg(not(unix))]
+            let _ = mode;
+        }
+        return Ok(());
+    }
+    let file = std::fs::File::open(archive).map_err(|e| format!("open {}: {e}", archive.display()))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("bad JRE archive: {e}"))?;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
+        let Some(rel) = entry.enclosed_name() else { continue };
+        let Some(rel) = inside(&rel)? else { continue };
+        let out = dest.join(rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+        } else {
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut f = std::fs::File::create(&out).map_err(|e| format!("write {}: {e}", out.display()))?;
+            std::io::copy(&mut entry, &mut f).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Make sure a Java runtime for `major` exists: reuse a matching installed one,
+/// otherwise download a JRE from Adoptium into `<root>/runtime/java-<major>`
+/// (Windows x64 and Linux; on other systems the user installs Java).
+pub fn ensure_java(client: &Client, root: &Path, major: u32, prog: Option<&Arc<InstallProgress>>) -> Result<PathBuf, String> {
+    if let Ok(p) = launch::find_java_path(None, Some(major)) {
+        return Ok(p);
+    }
+    let Some(platform) = adoptium_platform() else {
+        return Err(format!("Установите Java {major} или укажите путь в «Настройки»"));
+    };
+    // Adoptium ships 8, 11, 17, 21, 25; Mojang's 16 maps to 17.
+    let major = if major == 16 { 17 } else { major };
+    let target = root.join("runtime").join(format!("java-{major}"));
+    let exe = target.join("bin").join(java_file_name());
+    if exe.exists() {
+        return Ok(exe);
+    }
+    set_file(prog, &format!("downloading Java {major}"));
+    let (url, sha256) = adoptium_jre(client, major, platform)?;
+    let zip_path = root.join("runtime").join(format!("java-{major}{}", platform.2));
+    let dl = Arc::new(download::DownloadProgress::new("java"));
+    // mirror cancel flag + progress of the install progress object
+    let watcher_done = Arc::new(AtomicBool::new(false));
+    if let Some(p) = prog {
+        let (p, dl, done) = (p.clone(), dl.clone(), watcher_done.clone());
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                dl.cancelled.store(p.cancelled.load(Ordering::Relaxed), Ordering::Relaxed);
+                p.current.store(dl.current.load(Ordering::Relaxed), Ordering::Relaxed);
+                p.total.store(dl.total.load(Ordering::Relaxed), Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    }
+    let res = download::download_file_ex(client, &url, &zip_path, None, None, Some(&dl));
+    watcher_done.store(true, Ordering::Relaxed);
+    res?;
+    // Adoptium publishes a SHA-256 for every build: refuse anything else
+    let actual = download::file_sha256(&zip_path)?;
+    if !actual.eq_ignore_ascii_case(&sha256) {
+        let _ = std::fs::remove_file(&zip_path);
+        return Err(format!("Java {major}: SHA-256 архива не совпал — файл повреждён или подменён"));
+    }
+
+    set_file(prog, &format!("unpacking Java {major}"));
+    let tmp = root.join("runtime").join(format!("java-{major}.partial"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let unpack = unpack_jre(&zip_path, &tmp);
+    let _ = std::fs::remove_file(&zip_path);
+    if let Err(e) = unpack {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e);
+    }
+    if !tmp.join("bin").join(java_file_name()).exists() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(format!("в скачанном архиве нет {}", java_file_name()));
+    }
+    std::fs::rename(&tmp, &target).map_err(|e| format!("finalize Java: {e}"))?;
+    Ok(exe)
 }

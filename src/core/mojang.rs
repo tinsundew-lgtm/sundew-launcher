@@ -12,6 +12,9 @@ pub struct VersionEntry {
     pub kind: String, // release / snapshot / old_beta / old_alpha
     pub url: String,
     pub time: Option<String>,
+    /// SHA-1 of the version json (manifest v2).
+    #[serde(default)]
+    pub sha1: Option<String>,
 }
 
 /// Фильтр списка версий для UI (Пункт 2): по умолчанию — только релизы,
@@ -36,6 +39,7 @@ pub struct Latest {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct VersionJson {
     pub id: String,
     #[serde(default, deserialize_with = "main_class_string")]
@@ -50,11 +54,69 @@ pub struct VersionJson {
     #[serde(default)]
     pub asset_index: Option<AssetIndex>,
     pub arguments: Option<Arguments>,
+    /// Pre-1.13 versions keep game arguments as one string.
+    pub minecraft_arguments: Option<String>,
     pub java_version: Option<JavaVersion>,
+}
+
+impl VersionJson {
+    /// Merge a loader profile (`self`) with its `inheritsFrom` parent, the way
+    /// every launcher does: child values win, libraries/arguments are combined
+    /// (child first so loader classes shadow vanilla ones).
+    pub fn merged_with(&self, parent: &VersionJson) -> VersionJson {
+        let mut out = parent.clone();
+        out.id = self.id.clone();
+        out.inherits_from = None;
+        if self.main_class.is_some() {
+            out.main_class = self.main_class.clone();
+        }
+        let mut libs = self.libraries.clone();
+        for l in &parent.libraries {
+            if !libs.iter().any(|x| x.name == l.name) {
+                libs.push(l.clone());
+            }
+        }
+        out.libraries = libs;
+        if self.assets.is_some() {
+            out.assets = self.assets.clone();
+        }
+        if self.asset_index.is_some() {
+            out.asset_index = self.asset_index.clone();
+        }
+        if self.downloads.is_some() {
+            out.downloads = self.downloads.clone();
+        }
+        if self.java_version.is_some() {
+            out.java_version = self.java_version.clone();
+        }
+        if self.minecraft_arguments.is_some() {
+            out.minecraft_arguments = self.minecraft_arguments.clone();
+        }
+        if let Some(ca) = &self.arguments {
+            let pa = parent.arguments.clone().unwrap_or_default();
+            out.arguments = Some(Arguments {
+                game: concat_args(pa.game, ca.game.clone()),
+                jvm: concat_args(pa.jvm, ca.jvm.clone()),
+            });
+        }
+        out
+    }
+}
+
+fn concat_args(a: Option<serde_json::Value>, b: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some(serde_json::Value::Array(mut x)), Some(serde_json::Value::Array(y))) => {
+            x.extend(y);
+            Some(serde_json::Value::Array(x))
+        }
+        (x, _) => x,
+    }
 }
 
 /// The `assetIndex` object in a version json: where to fetch the asset index file.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct AssetIndex {
     pub id: String,
     #[serde(default)]
@@ -89,6 +151,7 @@ pub struct Arguments {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct JavaVersion {
     pub major_version: u32,
 }
@@ -139,7 +202,7 @@ impl Library {
         }
         let path = self.artifact_path()?;
         if let Some(base) = &self.url {
-            return Some(format!("{}{}", base.trim_end_matches('/'), path.display()));
+            return Some(format!("{}/{}", base.trim_end_matches('/'), path.to_string_lossy().replace('\\', "/")));
         }
         None
     }
@@ -196,6 +259,8 @@ pub struct DownloadableArtifact {
 pub struct Rule {
     pub action: String,
     pub os: Option<Os>,
+    /// Feature-gated rules (demo mode, custom resolution...) never match here.
+    pub features: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -229,30 +294,44 @@ where
 }
 
 fn rule_matches(rule: &Rule, os: &str, arch: &str) -> bool {
+    if rule.features.is_some() {
+        return false;
+    }
     match &rule.os {
         Some(o) => {
             let name_ok = o.name.is_none() || o.name.as_deref() == Some(os);
-            let arch_ok = o.arch.is_none() || o.arch.as_deref() == Some(arch);
+            // Mojang uses "x86"/"x86_64"/"arm64"; we only know 64-bit vs aarch64.
+            let arch_ok = match o.arch.as_deref() {
+                None => true,
+                Some("x86") => false,
+                Some("x86_64") => arch == "64",
+                Some("arm64") | Some("aarch64") => arch == "aarch64",
+                Some(other) => other == arch,
+            };
             name_ok && arch_ok
         }
         None => true,
     }
 }
 
+/// Evaluate a Mojang rule list: no rules = allowed; otherwise the last
+/// matching rule decides, default deny.
+pub fn rules_allow(rules: &[Rule], os: &str, arch: &str) -> bool {
+    if rules.is_empty() {
+        return true;
+    }
+    let mut allowed = false;
+    for r in rules {
+        if rule_matches(r, os, arch) {
+            allowed = r.action == "allow";
+        }
+    }
+    allowed
+}
+
 pub fn library_allowed(lib: &Library, os: &str, arch: &str) -> bool {
     match &lib.rules {
-        Some(rules) => {
-            let mut allowed = false;
-            for r in rules {
-                let matches = rule_matches(r, os, arch);
-                if r.action == "allow" && matches {
-                    allowed = true;
-                } else if r.action == "disallow" && matches {
-                    return false;
-                }
-            }
-            allowed
-        }
+        Some(rules) => rules_allow(rules, os, arch),
         None => true,
     }
 }
@@ -277,7 +356,25 @@ pub fn fetch_version_json(
     client: &reqwest::blocking::Client,
     entry: &VersionEntry,
 ) -> Result<VersionJson, String> {
-    download::get_json(client, &entry.url)
+    fetch_version_json_text(client, entry).map(|(v, _)| v)
+}
+
+/// Same, but also returns the original response text so the caller can store
+/// the genuine Mojang JSON instead of a re-serialized copy.
+pub fn fetch_version_json_text(
+    client: &reqwest::blocking::Client,
+    entry: &VersionEntry,
+) -> Result<(VersionJson, String), String> {
+    let text = download::get_text(client, &entry.url)?;
+    if let Some(expected) = entry.sha1.as_deref().filter(|h| !h.is_empty()) {
+        use sha1::{Digest, Sha1};
+        let actual = hex::encode(Sha1::digest(text.as_bytes()));
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(format!("version json {}: контрольная сумма не совпала (ожидалось {expected}, получено {actual})", entry.id));
+        }
+    }
+    let v = serde_json::from_str(&text).map_err(|e| format!("parse version json {}: {e}", entry.id))?;
+    Ok((v, text))
 }
 
 #[cfg(test)]
@@ -338,6 +435,72 @@ mod tests {
     }
 
     #[test]
+    fn version_json_is_verified_by_sha1() {
+        use crate::testsupport::{Mock, route};
+        use sha1::{Digest, Sha1};
+        let m = Mock::start();
+        let body = r#"{"id":"26.3","libraries":[]}"#;
+        m.set(vec![route("/v.json", 200, body)]);
+        let c = reqwest::blocking::Client::new();
+        let good = hex::encode(Sha1::digest(body.as_bytes()));
+        let mut entry = VersionEntry { id: "26.3".into(), kind: "release".into(), url: format!("{}/v.json", m.url()), time: None, sha1: Some(good) };
+        assert_eq!(fetch_version_json_text(&c, &entry).unwrap().0.id, "26.3");
+        entry.sha1 = Some("0".repeat(40));
+        assert!(fetch_version_json_text(&c, &entry).unwrap_err().contains("контрольная сумма"));
+    }
+
+    /// Real network: the hash check must accept genuine Mojang files.
+    /// `cargo test --release -- --ignored real_mojang`
+    #[test]
+    #[ignore]
+    fn real_mojang_version_json_passes_the_hash_check() {
+        let c = crate::core::install::make_client();
+        let manifest = fetch_manifest(&c).unwrap();
+        for id in [manifest.latest.release.clone(), "1.21.1".to_string(), "1.12.2".to_string()] {
+            let entry = find_version(&manifest, &id).unwrap();
+            assert!(entry.sha1.is_some(), "manifest v2 carries sha1");
+            let (v, _) = fetch_version_json_text(&c, &entry).unwrap();
+            assert_eq!(v.id, id);
+        }
+    }
+
+    #[test]
+    fn vanilla_json_camel_case() {
+        let vj: VersionJson = serde_json::from_str(
+            r#"{"id":"1.21.1","mainClass":"net.minecraft.client.main.Main","assets":"17",
+            "assetIndex":{"id":"17","sha1":"a","size":1,"url":"https://x/17.json","totalSize":5},
+            "javaVersion":{"component":"java-runtime-delta","majorVersion":21},
+            "inheritsFrom":"1.21","libraries":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(vj.main_class.as_deref(), Some("net.minecraft.client.main.Main"));
+        assert_eq!(vj.asset_index.as_ref().unwrap().total_size, Some(5));
+        assert_eq!(vj.java_version.as_ref().unwrap().major_version, 21);
+        assert_eq!(vj.inherits_from.as_deref(), Some("1.21"));
+    }
+
+    #[test]
+    fn fabric_profile_merges_with_parent() {
+        let parent: VersionJson = serde_json::from_str(
+            r#"{"id":"1.21.1","mainClass":"net.minecraft.client.main.Main","assets":"17",
+            "libraries":[{"name":"a:b:1"}],"arguments":{"game":["--x"],"jvm":["-Da"]}}"#,
+        )
+        .unwrap();
+        let child: VersionJson = serde_json::from_str(
+            r#"{"id":"fabric-loader-0.16.9-1.21.1","inheritsFrom":"1.21.1",
+            "mainClass":"net.fabricmc.loader.impl.launch.knot.KnotClient",
+            "libraries":[{"name":"org.ow2.asm:asm:9.7.1","url":"https://maven.fabricmc.net/"}],
+            "arguments":{"game":[],"jvm":["-Db"]}}"#,
+        )
+        .unwrap();
+        let m = child.merged_with(&parent);
+        assert_eq!(m.main_class.as_deref(), Some("net.fabricmc.loader.impl.launch.knot.KnotClient"));
+        assert_eq!(m.assets.as_deref(), Some("17"));
+        assert_eq!(m.libraries.len(), 2);
+        assert_eq!(m.arguments.unwrap().jvm.unwrap().as_array().unwrap().len(), 2);
+    }
+
+    #[test]
     fn rules_windows() {
         let lib: Library = serde_json::from_str(
             r#"{"name":"org.lwjgl:lwjgl-platform:3.3.3","rules":[{"action":"allow","os":{"name":"windows"}}]}"#,
@@ -353,7 +516,7 @@ mod tests {
     #[test]
     fn filter_versions_release_snap() {
         fn e(id: &str, kind: &str) -> VersionEntry {
-            VersionEntry { id: id.to_string(), kind: kind.to_string(), url: "u".into(), time: None }
+            VersionEntry { id: id.to_string(), kind: kind.to_string(), url: "u".into(), time: None, sha1: None }
         }
         let list = vec![
             e("1.21.1", "release"),

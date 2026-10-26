@@ -1,7 +1,13 @@
 pub mod account;
 pub mod download;
+pub mod images;
+pub mod import;
 pub mod install;
 pub mod instance;
 pub mod launch;
-pub mod mojang;
 pub mod modrinth;
+pub mod mods;
+pub mod netcheck;
+pub mod prefs;
+pub mod skins;
+pub mod mojang;

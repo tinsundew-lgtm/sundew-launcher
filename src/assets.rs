@@ -1,44 +1,27 @@
 //! Asset helpers: decode bundled images (include_bytes!) and register them as
 //! egui textures. Any failure returns `None` so the UI falls back gracefully.
 
-use eframe::egui::{self, Color32, ColorImage, TextureHandle, TextureOptions};
+use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 
-/// Decode `bytes` (PNG/JPG/ICO via `image::load_from_memory`) into an egui texture.
-fn from_bytes(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<TextureHandle> {
+/// Decode `bytes` (PNG/ICO via `image::load_from_memory`) into an egui texture.
+fn from_bytes(ctx: &egui::Context, name: &str, bytes: &[u8], options: TextureOptions) -> Option<TextureHandle> {
     let img = image::load_from_memory(bytes).ok()?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     let size = [w as usize, h as usize];
     let color = ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-    Some(ctx.load_texture(name, color, TextureOptions::LINEAR))
-}
-
-fn hero(ctx: &egui::Context) -> Option<TextureHandle> {
-    from_bytes(ctx, "hero", include_bytes!("../assets/hero-1920x1080.jpg"))
-}
-fn badge(ctx: &egui::Context) -> Option<TextureHandle> {
-    from_bytes(ctx, "badge", include_bytes!("../assets/badge-256.jpg"))
-}
-fn play_icon(ctx: &egui::Context) -> Option<TextureHandle> {
-    from_bytes(ctx, "play", include_bytes!("../assets/play-256.jpg"))
-}
-fn empty_state(ctx: &egui::Context) -> Option<TextureHandle> {
-    from_bytes(ctx, "empty", include_bytes!("../assets/empty-state.png"))
-}
-fn modpack_icon(ctx: &egui::Context) -> Option<TextureHandle> {
-    from_bytes(ctx, "modpack", include_bytes!("../assets/modpack-256.png"))
+    Some(ctx.load_texture(name, color, options))
 }
 
 /// All textures loaded once at startup.
 pub struct Assets {
-    pub hero: Option<TextureHandle>,
-    pub badge: Option<TextureHandle>,
-    pub play_icon: Option<TextureHandle>,
+    /// The launcher icon (16x16 pixel art, drawn enlarged without smoothing).
+    pub icon: Option<TextureHandle>,
     pub empty_state: Option<TextureHandle>,
     pub modpack_icon: Option<TextureHandle>,
 }
 
-/// Fallback: a tiny 1x1 transparent texture so callers always have something.
+/// Fallback: a tiny 1x1 white texture so callers always have something.
 fn blank(ctx: &egui::Context) -> TextureHandle {
     let color = ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
     ctx.load_texture("blank", color, TextureOptions::LINEAR)
@@ -46,37 +29,55 @@ fn blank(ctx: &egui::Context) -> TextureHandle {
 
 impl Assets {
     pub fn load(ctx: &egui::Context) -> Self {
+        let tex = |name, bytes: &[u8]| from_bytes(ctx, name, bytes, TextureOptions::LINEAR).or_else(|| Some(blank(ctx)));
         Self {
-            hero: hero(ctx).or_else(|| Some(blank(ctx))),
-            badge: badge(ctx).or_else(|| Some(blank(ctx))),
-            play_icon: play_icon(ctx).or_else(|| Some(blank(ctx))),
-            empty_state: empty_state(ctx).or_else(|| Some(blank(ctx))),
-            modpack_icon: modpack_icon(ctx).or_else(|| Some(blank(ctx))),
+            icon: from_bytes(ctx, "icon", include_bytes!("../assets/icon-16.png"), TextureOptions::NEAREST).or_else(|| Some(blank(ctx))),
+            empty_state: tex("empty", include_bytes!("../assets/empty-state.png")),
+            modpack_icon: tex("modpack", include_bytes!("../assets/modpack-128.png")),
         }
     }
 }
 
-/// Draw `tex` stretched over `rect`, preserving aspect, cropping overflow
-/// (cover-fit) so a photo fills a panel without distortion.
-pub fn paint_cover(painter: &egui::Painter, tex: &TextureHandle, rect: egui::Rect, tint: Color32) {
-    if rect.width() <= 0.0 || rect.height() <= 0.0 {
-        return;
+#[cfg(test)]
+mod tests {
+    /// The sizes the exe icon has to contain.
+    const ICO_SIZES: [u32; 6] = [16, 32, 48, 64, 128, 256];
+
+    #[test]
+    fn the_icon_is_the_sharp_enlargement_of_the_16px_master() {
+        let master = image::load_from_memory(include_bytes!("../assets/icon-16.png")).unwrap().to_rgba8();
+        assert_eq!(master.dimensions(), (16, 16));
+        let big = image::load_from_memory(include_bytes!("../assets/icon-256.png")).unwrap().to_rgba8();
+        assert_eq!(big.dimensions(), (256, 256));
+        // every master pixel became a 16x16 block of the same colour (no smoothing)
+        for (x, y) in [(0u32, 0u32), (3, 5), (8, 8), (15, 15), (7, 12)] {
+            let want = master.get_pixel(x, y);
+            for (dx, dy) in [(0, 0), (15, 15), (7, 9)] {
+                assert_eq!(big.get_pixel(x * 16 + dx, y * 16 + dy), want, "block {x},{y}");
+            }
+        }
+        assert_eq!(master.get_pixel(0, 0)[3], 0, "the corner is transparent");
     }
-    let st = egui::load::SizedTexture::from_handle(tex);
-    let (iw, ih) = (st.size.x, st.size.y);
-    if iw <= 0.0 || ih <= 0.0 {
-        return;
+
+    #[test]
+    fn the_exe_icon_has_every_size_and_each_picture_is_valid() {
+        let ico: &[u8] = include_bytes!("../assets/icon.ico");
+        let u16_at = |i: usize| u16::from_le_bytes([ico[i], ico[i + 1]]) as usize;
+        let u32_at = |i: usize| u32::from_le_bytes([ico[i], ico[i + 1], ico[i + 2], ico[i + 3]]) as usize;
+        assert_eq!((u16_at(0), u16_at(2)), (0, 1), "an icon file");
+        let count = u16_at(4);
+        assert_eq!(count, ICO_SIZES.len());
+        let mut seen = Vec::new();
+        for i in 0..count {
+            let e = 6 + 16 * i;
+            let size = if ico[e] == 0 { 256 } else { ico[e] as u32 };
+            let (len, offset) = (u32_at(e + 8), u32_at(e + 12));
+            let img = image::load_from_memory(&ico[offset..offset + len]).expect("a PNG picture").to_rgba8();
+            assert_eq!(img.dimensions(), (size, size));
+            assert_eq!(img.get_pixel(0, 0)[3], 0, "transparent corner at {size} px");
+            assert!(img.get_pixel(size / 2, size / 2)[3] == 255);
+            seen.push(size);
+        }
+        assert_eq!(seen, ICO_SIZES);
     }
-    let img_aspect = iw / ih;
-    let rect_aspect = rect.width() / rect.height();
-    let outer = if img_aspect > rect_aspect {
-        // image is wider than panel -> match height, the width overflows & gets cropped
-        let w = rect.height() * img_aspect;
-        egui::Rect::from_center_size(rect.center(), egui::vec2(w, rect.height()))
-    } else {
-        let h = rect.width() / img_aspect;
-        egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), h))
-    };
-    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-    painter.image(st.id, outer, uv, tint);
 }

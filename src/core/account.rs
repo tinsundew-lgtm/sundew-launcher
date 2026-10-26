@@ -1,74 +1,66 @@
-use std::fmt;
+//! Offline player profile: a nickname and the UUID Minecraft derives from it.
+//! There is no Microsoft sign-in: the game runs in offline mode (singleplayer,
+//! LAN and servers with `online-mode=false`).
 
 use serde::{Deserialize, Serialize};
 
-/// Какой способ авторизации использует аккаунт.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum AuthProvider {
-    /// Офлайн-режим: только ник, UUID выводится из ника.
-    #[default]
-    Offline,
-    /// Заготовка под Microsoft-логин (пока не реализовано в этом сборке).
-    Microsoft,
-}
-
-impl fmt::Display for AuthProvider {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AuthProvider::Offline => write!(f, "Offline"),
-            AuthProvider::Microsoft => write!(f, "Microsoft"),
-        }
-    }
-}
-
-/// Учётная запись лаунчера. Хранится в launcher_state.json.
+/// Учётная запись лаунчера (офлайн). Хранится в launcher_state.json.
+/// Старые поля (provider, токены) из прежних версий просто игнорируются.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Account {
-    pub provider: AuthProvider,
     pub username: String,
-    /// Заполняется для Microsoft-аккаунта (после реализации OAuth).
+    /// Фиксированный UUID (необязательно); иначе выводится из ника.
     #[serde(default)]
     pub uuid: Option<String>,
-    /// Произвольный access token (для Microsoft — токен XSTS/Minecraft).
+    /// Аватар: имя файла в `<data>/profiles/`.
     #[serde(default)]
-    pub access_token: Option<String>,
+    pub avatar: Option<String>,
+    /// Skin of the library (`skins::Skin::id`) shown in the game by CustomSkinLoader.
     #[serde(default)]
-    pub refresh_token: Option<String>,
+    pub skin: Option<String>,
 }
 
 impl Account {
-    /// Офлайн-аккаунт по умолчанию: стандартный ник «Player».
+    /// Аккаунт по умолчанию: ник «Player».
     pub fn offline_default() -> Self {
-        Self {
-            provider: AuthProvider::Offline,
-            username: "Player".to_string(),
-            uuid: None,
-            access_token: None,
-            refresh_token: None,
-        }
+        Self { username: "Player".to_string(), uuid: None, avatar: None, skin: None }
     }
 
     /// UUID, передаваемый в аргументы запуска игры.
     pub fn resolved_uuid(&self) -> String {
-        if let Some(u) = &self.uuid {
-            if !u.is_empty() {
-                return u.clone();
-            }
+        match &self.uuid {
+            Some(u) if !u.is_empty() => u.clone(),
+            _ => offline_uuid(&self.username),
         }
-        offline_uuid(&self.username)
-    }
-
-    /// Токен для запуска: офлайн — «0», иначе сохранённый access token.
-    pub fn resolved_token(&self) -> String {
-        self.access_token
-            .as_deref()
-            .filter(|t| !t.is_empty())
-            .unwrap_or("0")
-            .to_string()
     }
 }
 
-/// Детерминированный офлайн-UUID по алгоритму Minecraft/bungee:
+/// Minecraft accepts 3–16 characters: Latin letters, digits and `_`.
+pub fn valid_nickname(name: &str) -> bool {
+    (3..=16).contains(&name.chars().count()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// What the game needs to start.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LaunchAuth {
+    pub username: String,
+    pub uuid: String,
+    /// Always `"0"`: offline mode has no access token.
+    pub token: String,
+}
+
+/// Credentials for an offline launch.
+pub fn launch_auth(account: &Account) -> Result<LaunchAuth, String> {
+    if !valid_nickname(&account.username) {
+        return Err(format!(
+            "Ник «{}» не подходит: нужно 3–16 символов, латиница, цифры и _ (Настройки → Учётная запись)",
+            account.username
+        ));
+    }
+    Ok(LaunchAuth { username: account.username.clone(), uuid: account.resolved_uuid(), token: "0".to_string() })
+}
+
+/// Детерминированный офлайн-UUID по алгоритму Minecraft:
 /// UUID v3 (MD5) от строки "OfflinePlayer:<name>", версия 3, вариант RFC 4122.
 pub fn offline_uuid(name: &str) -> String {
     use md5::{Digest, Md5};
@@ -81,14 +73,7 @@ pub fn offline_uuid(name: &str) -> String {
     bytes[6] = (bytes[6] & 0x0f) | 0x30;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let hex = hex::encode(bytes);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
+    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
 }
 
 #[cfg(test)]
@@ -98,19 +83,38 @@ mod tests {
     #[test]
     fn offline_uuid_stable_and_v3() {
         let a = offline_uuid("Player");
-        let b = offline_uuid("Player");
-        assert_eq!(a, b);
-        // Формат 8-4-4-4-12
+        assert_eq!(a, offline_uuid("Player"));
         let parts: Vec<&str> = a.split('-').collect();
-        assert_eq!(parts.len(), 5);
-        assert_eq!(parts[0].len(), 8);
-        assert_eq!(parts[1].len(), 4);
-        assert_eq!(parts[2].len(), 4);
-        // Версия = '3' в 13-м символе
-        assert_eq!(&a[14..15], "3");
-        // Известное значение для Player: 20df558d-8a7d-3b6b-8f5c-6e34a4f4e... — просто проверяем стабильность.
-        // Ник пустой -> даём осмысленный uuid
-        let c = offline_uuid("");
-        assert_eq!(c.split('-').count(), 5);
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), vec![8, 4, 4, 4, 12]);
+        assert_eq!(&a[14..15], "3", "version 3");
+        assert_ne!(offline_uuid("Player"), offline_uuid("player"), "case matters, like in Minecraft");
+    }
+
+    #[test]
+    fn nickname_rules() {
+        assert!(valid_nickname("Steve_01"));
+        assert!(!valid_nickname("ab"));
+        assert!(!valid_nickname("seventeen_chars_x"));
+        assert!(!valid_nickname("Стив"));
+        assert!(!valid_nickname("with space"));
+    }
+
+    #[test]
+    fn launch_is_offline_with_nickname_uuid() {
+        let mut acc = Account::offline_default();
+        acc.username = "Steve_01".into();
+        let a = launch_auth(&acc).unwrap();
+        assert_eq!(a.token, "0");
+        assert_eq!(a.uuid, offline_uuid("Steve_01"));
+        acc.username = "x".into();
+        assert!(launch_auth(&acc).unwrap_err().contains("3–16"));
+    }
+
+    #[test]
+    fn old_state_files_still_load() {
+        // a state written by the Microsoft-login versions
+        let old = r#"{"provider":"Microsoft","username":"Notch","uuid":null,"access_token":"x"}"#;
+        let a: Account = serde_json::from_str(old).unwrap();
+        assert_eq!(a.username, "Notch");
     }
 }
