@@ -34,8 +34,9 @@ sudo apt install libgtk-3-0 libxkbcommon0 libgl1
 
 ## Сборка из исходников
 
-В архиве с исходниками: `./build-linux.sh` (поставит нужные пакеты через `apt`, соберёт
-программу и положит результат в `dist/`). Нужен Rust: <https://rustup.rs>.
+В папке с исходниками: `./packaging/linux/build-linux.sh` (поставит нужные пакеты через `apt`,
+соберёт программу и положит результат в `dist/` в корне проекта). Потом `./dist/install.sh`.
+Нужен Rust: <https://rustup.rs>. Папка `dist/` в git не попадает.
 
 ## Что отличается от Windows
 

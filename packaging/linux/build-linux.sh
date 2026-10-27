@@ -1,9 +1,20 @@
 #!/bin/sh
 # Builds LimeCraft from source on Linux Mint / Ubuntu / Debian.
-#   ./build-linux.sh          builds, result: ./dist/
-#   ./dist/install.sh         installs it for your user
+#   ./packaging/linux/build-linux.sh   builds, result: ./dist/ in the project root
+#   ./dist/install.sh                  installs it for your user
+# dist/ is a build result: it is listed in .gitignore and never goes into git.
 set -e
-cd "$(dirname "$0")"
+# Find the project root (the folder with Cargo.toml): the script may lie in
+# packaging/linux/ (git checkout) or right in the root (source archive).
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+while [ ! -f "$ROOT/Cargo.toml" ]; do
+    if [ "$ROOT" = "/" ]; then
+        echo "Cargo.toml not found: run this script from the LimeCraft sources" >&2
+        exit 1
+    fi
+    ROOT="$(dirname "$ROOT")"
+done
+cd "$ROOT"
 
 if ! command -v cargo >/dev/null 2>&1; then
     echo "Rust is not installed. Install it first (one command, from https://rustup.rs):" >&2

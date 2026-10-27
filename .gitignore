@@ -40,3 +40,27 @@ Thumbs.db
 
 # Готовые сборки выпусков (выкладываются в GitHub Releases, не в репо)
 /release-*/
+
+# Результат ./packaging/linux/build-linux.sh (готовая программа и install.sh)
+/dist/
+/packaging/linux/dist/
+*.tar.gz
+
+# Служебные файлы: планы, ревью, заметки, файлы для ИИ-агентов
+/PLAN.md
+/REVIEW.md
+/ASSET_PROMPT.md
+/assets/MANIFEST.md
+/assets/make_icon.py
+/assets/originals/
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.claude/
+.cursor/
+.cursorrules
+.windsurfrules
+.aider*
+/notes/
+/TODO.md
+*.log
