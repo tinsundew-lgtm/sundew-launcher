@@ -369,6 +369,81 @@ pub fn install(
     Ok(report)
 }
 
+/// The newest version of a project that fits the instance (game version and loader).
+pub fn newest_fitting(client: &Client, inst: &Instance, kind: ContentKind, project_id: &str) -> Result<Option<Version>, String> {
+    let list = if inst.game_version.is_empty() || inst.game_version == "latest" {
+        modrinth::get_project_versions(client, project_id)?
+    } else {
+        let loaders = if kind.uses_loader() { mod_loaders(inst) } else { Vec::new() };
+        modrinth::get_versions_for(client, project_id, &inst.game_version, &loaders)?
+    };
+    Ok(list.into_iter().max_by(|a, b| a.date_published.cmp(&b.date_published)))
+}
+
+/// One project to put into an instance: a chosen version, or the newest one that fits.
+#[derive(Clone, Debug)]
+pub struct Want {
+    pub kind: ContentKind,
+    pub project_id: String,
+    pub title: String,
+    pub version: Option<Version>,
+}
+
+/// Install several projects one after another. A project that cannot be installed
+/// is reported in `warnings` and does not stop the others (a cancel does).
+pub fn install_many(
+    client: &Client,
+    root: &Path,
+    inst: &Instance,
+    wants: &[Want],
+    prog: Option<&Arc<InstallProgress>>,
+) -> Result<InstallReport, String> {
+    let mut report = InstallReport::default();
+    for w in wants {
+        let version = match &w.version {
+            Some(v) => Some(v.clone()),
+            None => match newest_fitting(client, inst, w.kind, &w.project_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    report.warnings.push(format!("{}: {e}", w.title));
+                    continue;
+                }
+            },
+        };
+        let Some(version) = version else {
+            report.warnings.push(format!("{}: нет версии под Minecraft {}", w.title, inst.game_version));
+            continue;
+        };
+        // a project that is already in the instance is updated in place, never copied
+        let mut present = scan(root, &inst.name, w.kind).unwrap_or_default();
+        let _ = identify(client, &mut present);
+        if let Some(item) = present.iter().find(|i| i.project_id.as_deref() == Some(version.project_id.as_str())) {
+            let same = version.files.iter().any(|f| f.hashes.get("sha1").is_some_and(|h| h.eq_ignore_ascii_case(&item.sha1)));
+            if same {
+                continue;
+            }
+            match apply_update(client, root, inst, w.kind, item, &version, prog) {
+                Ok(path) => report.installed.push(path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()),
+                Err(e) if e == "Cancelled" => return Err(e),
+                Err(e) => report.warnings.push(format!("{}: {e}", w.title)),
+            }
+            continue;
+        }
+        match install(client, root, inst, w.kind, &version, prog) {
+            Ok(r) => {
+                report.installed.extend(r.installed);
+                report.warnings.extend(r.warnings);
+            }
+            Err(e) if e == "Cancelled" => return Err(e),
+            Err(e) => report.warnings.push(format!("{}: {e}", w.title)),
+        }
+    }
+    if report.installed.is_empty() && !report.warnings.is_empty() {
+        return Err(report.warnings.join("; "));
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

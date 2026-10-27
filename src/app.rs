@@ -54,6 +54,7 @@ enum ModsView {
     Installed,
     Modpacks,
     Favorites,
+    Cart,
 }
 
 /// Run a blocking closure on a worker thread, exposing the result through a
@@ -213,6 +214,8 @@ pub struct LimeApp {
     mods: catalog::Browse,
     /// Modrinth categories for the filters.
     tags: catalog::Tags,
+    /// Projects collected for a one-button install.
+    cart: cart::Cart,
     /// The open project card (page `Project`).
     project_view: Option<project::ProjectView>,
     mod_install_prog: Option<Arc<install::InstallProgress>>,
@@ -399,6 +402,7 @@ impl LimeApp {
             pack_install_job: None,
             mods: catalog::Browse::new(),
             tags: Default::default(),
+            cart: Default::default(),
             project_view: None,
             mod_install_prog: None,
             mod_install_job: None,
@@ -501,6 +505,7 @@ impl LimeApp {
         self.versions_job.is_some()
             || self.packs.busy()
             || self.tags.busy()
+            || self.cart.job.is_some()
             || self.pack_install_job.is_some()
             || self.mods.busy()
             || self.project_view.as_ref().is_some_and(|v| v.project_job.is_some() || v.versions_job.is_some())
@@ -1100,18 +1105,26 @@ impl LimeApp {
                 self.mod_install_prog = None;
                 match res {
                     Ok(report) => {
-                        let mut text = format!("Установлено: {}", report.installed.join(", "));
+                        self.cart_install_done(true);
+                        let mut text = if report.installed.is_empty() {
+                            "Ничего нового: всё уже установлено".to_string()
+                        } else {
+                            format!("Установлено: {}", report.installed.join(", "))
+                        };
                         if !report.warnings.is_empty() {
                             text.push_str(&format!("\nПредупреждения: {}", report.warnings.join("; ")));
                         }
                         self.mod_install_report = Some(text);
                         self.installed_for = None; // список «Установленные» устарел
                     }
-                    Err(e) => self.toast = Some(format!("Ошибка установки: {}", friendly(&e))),
+                    Err(e) => {
+                        self.cart_install_done(false);
+                        self.toast = Some(format!("Ошибка установки: {}", friendly(&e)));
+                    }
                 }
             }
         }
-
+        self.poll_cart();
 
         // network check
         if let Some(job) = &self.net_job {
@@ -3056,9 +3069,9 @@ impl LimeApp {
         ui.add_space(14.0);
         ui::heading(ui, "Каталог Modrinth");
         ui.add_space(8.0);
-        let views = [ModsView::Catalog, ModsView::Installed, ModsView::Modpacks, ModsView::Favorites];
+        let views = [ModsView::Catalog, ModsView::Installed, ModsView::Modpacks, ModsView::Favorites, ModsView::Cart];
         let mut sel = views.iter().position(|v| *v == self.mods_view).unwrap_or(0);
-        let tabs = [(Some(Icon::Compass), "Каталог"), (Some(Icon::Cube), "Установленные"), (Some(Icon::Download), "Модпаки"), (Some(Icon::Star), "Избранное")];
+        let tabs = [(Some(Icon::Compass), "Каталог"), (Some(Icon::Cube), "Установленные"), (Some(Icon::Download), "Модпаки"), (Some(Icon::Star), "Избранное"), (Some(Icon::Cart), "Корзина")];
         if ui::pill_tabs(ui, &tabs, &mut sel) {
             self.mods_view = views[sel];
         }
@@ -3066,6 +3079,7 @@ impl LimeApp {
         match self.mods_view {
             ModsView::Modpacks => self.draw_modpacks(ui),
             ModsView::Favorites => self.draw_favorites(ui),
+            ModsView::Cart => self.draw_cart(ui),
             ModsView::Catalog => {
                 self.draw_content_header(ui);
                 self.draw_mods_catalog(ui);
@@ -3108,6 +3122,7 @@ impl LimeApp {
                 self.content_kind = kinds[ksel];
                 self.reset_mod_search();
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.cart_link(ui));
         });
         if let Some(inst) = self.state.instances.get(self.active_index()) {
             if self.content_kind == mods::ContentKind::Mod && inst.loader.is_empty() {
@@ -4049,7 +4064,9 @@ impl LimeApp {
     }
 }
 
+mod cart;
 mod catalog;
+mod deps;
 mod project;
 #[cfg(test)]
 mod snapshot;

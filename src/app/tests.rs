@@ -1532,3 +1532,194 @@ fn snapshots_of_the_catalog() {
     h.snapshot("c8-soft-filters");
 }
 
+// ------------------------------------------------------------------ project card+ (1.0.3)
+
+#[allow(clippy::too_many_arguments)]
+fn version_with(id: &str, project: &str, number: &str, date: &str, deps: &str, changelog: &str, file_url: &str, filename: &str, bytes: &[u8]) -> String {
+    format!(
+        r#"{{"id":"{id}","project_id":"{project}","name":"{number}","version_number":"{number}","version_type":"release","game_versions":["26.3"],"loaders":["fabric"],"date_published":"{date}","downloads":1,"changelog":{},"files":[{{"url":"{file_url}","filename":"{filename}","primary":true,"size":100,"hashes":{{"sha1":"{}"}}}}],"dependencies":[{deps}]}}"#,
+        serde_json::to_string(changelog).unwrap(),
+        sha1_hex(bytes)
+    )
+}
+
+fn project_min(id: &str, title: &str, kind: &str) -> String {
+    format!(r#"{{"id":"{id}","slug":"{id}","title":"{title}","description":"{title} does things","project_type":"{kind}","downloads":5,"followers":1,"categories":[]}}"#)
+}
+
+#[test]
+fn the_dependencies_tab_lists_and_installs_what_is_missing() {
+    let _g = lock();
+    let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
+    let base = h.mock.url();
+    let dep_jar = b"api-jar".to_vec();
+    let deps = r#"{"project_id":"API","version_id":null,"dependency_type":"required"},
+                  {"project_id":"OPT","version_id":null,"dependency_type":"optional"},
+                  {"project_id":"BAD","version_id":null,"dependency_type":"incompatible"}"#;
+    let main_v = version_with("v1", "AAA", "2.0", "2026-02-01T00:00:00Z", deps, "", &format!("{base}/files/main.jar"), "main.jar", b"main");
+    let api_v = version_with("a1", "API", "9.0", "2026-01-01T00:00:00Z", "", "", &format!("{base}/files/api.jar"), "api.jar", &dep_jar);
+    h.mock.set(vec![
+        route("/search", 200, search_json(&[("AAA", "Main")])),
+        route("/project/AAA/version", 200, format!("[{main_v}]")),
+        route("/project/AAA", 200, project_json("AAA", "mod", &base)),
+        route("/project/API/version", 200, format!("[{api_v}]")),
+        route("/projects", 200, format!("[{},{},{}]", project_min("API", "Fabric API", "mod"), project_min("OPT", "Nice Extra", "mod"), project_min("BAD", "Clashing Mod", "mod"))),
+        route("/version_files", 200, "{}"),
+        route("/files/api.jar", 200, dep_jar.clone()),
+    ]);
+    h.click("Каталог");
+    h.wait("search", 10, |a| a.mods.searched);
+    h.click("card:AAA");
+    h.wait("card", 10, |a| a.project_view.as_ref().is_some_and(|v| v.project.is_some() && v.versions_job.is_none()));
+    h.click("Зависимости");
+    h.wait("dependencies", 10, |a| a.project_view.as_ref().is_some_and(|v| v.deps.is_some()));
+    h.frame(vec![]);
+    let items = &h.app.project_view.as_ref().unwrap().deps.as_ref().unwrap().items;
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0].hit.title, "Fabric API", "required first");
+    assert!(h.has("dep-install:API") && h.has("dep-install:OPT") && !h.has("dep-install:BAD"), "screen: {:?}", h.labels());
+    assert!(h.has("Установить недостающие обязательные (1)"), "screen: {:?}", h.labels());
+
+    h.click("dep-install:API");
+    h.wait("dependency installed", 20, |a| a.mod_install_job.is_none() && a.mod_install_report.is_some());
+    let mods = instance::instance_mines(&h.root, "26.3 fabric").join("mods");
+    assert_eq!(std::fs::read(mods.join("api.jar")).expect("the dependency"), dep_jar);
+    assert!(!mods.join("main.jar").exists(), "only the dependency was installed");
+}
+
+#[test]
+fn an_installed_project_can_be_updated_from_its_card_and_changes_unfold() {
+    let _g = lock();
+    let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
+    let base = h.mock.url();
+    let known = install_known_jar(&h, "26.3 fabric", "m-1.jar", b"m1", "AAA", "1.0");
+    let v2 = version_with("v2", "AAA", "2.0", "2026-03-01T00:00:00Z", "", "## What is new\n\n- faster chunks", &format!("{base}/files/m-2.jar"), "m-2.jar", b"m2");
+    let v1 = version_with("v1", "AAA", "1.0", "2026-01-01T00:00:00Z", "", "", &format!("{base}/files/m-1.jar"), "m-1.jar", b"m1");
+    h.mock.set(vec![
+        route("/search", 200, search_json(&[("AAA", "Main")])),
+        route("/version_files", 200, known),
+        route("/projects", 200, "[]"),
+        route("/project/AAA/version", 200, format!("[{v1},{v2}]")),
+        route("/project/AAA", 200, project_json("AAA", "mod", &base)),
+        route("/files/m-2.jar", 200, "m2"),
+    ]);
+    h.click("Каталог");
+    h.wait("installed list", 10, |a| a.mods.searched && !a.installed_items.is_empty());
+    h.click("card:AAA");
+    h.wait("card", 10, |a| a.project_view.as_ref().is_some_and(|v| v.project.is_some() && v.versions_job.is_none()));
+    h.frame(vec![]);
+    let v = h.app.project_view.as_ref().unwrap();
+    assert_eq!(v.versions[0].version_number, "2.0", "newest first");
+    assert!(h.has("Обновить до 2.0") && h.has("Удалить из сборки"), "screen: {:?}", h.labels());
+
+    // changes of a version unfold in the list
+    h.click("Версии");
+    assert!(h.has("changes:v2") && !h.has("changes:v1"), "only versions with notes: {:?}", h.labels());
+    h.click("changes:v2");
+    assert!(h.app.project_view.as_ref().unwrap().expanded.contains("v2"));
+    assert!(h.app.project_view.as_ref().unwrap().changelogs.contains_key("v2"));
+
+    h.click("Обновить до 2.0");
+    h.wait("updated", 20, |a| a.mod_install_job.is_none() && a.mod_install_report.is_some());
+    let mods = instance::instance_mines(&h.root, "26.3 fabric").join("mods");
+    assert!(mods.join("m-2.jar").exists() && !mods.join("m-1.jar").exists(), "the file was replaced");
+}
+
+#[test]
+fn removing_from_the_card_deletes_the_file() {
+    let _g = lock();
+    let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
+    let base = h.mock.url();
+    let known = install_known_jar(&h, "26.3 fabric", "gone.jar", b"gone", "AAA", "1.0");
+    h.mock.set(vec![
+        route("/search", 200, search_json(&[("AAA", "Main")])),
+        route("/version_files", 200, known),
+        route("/projects", 200, "[]"),
+        route("/project/AAA/version", 200, "[]"),
+        route("/project/AAA", 200, project_json("AAA", "mod", &base)),
+    ]);
+    h.click("Каталог");
+    h.wait("installed list", 10, |a| a.mods.searched && !a.installed_items.is_empty());
+    h.click("card:AAA");
+    h.wait("card", 10, |a| a.project_view.as_ref().is_some_and(|v| v.project.is_some() && v.versions_job.is_none()));
+    h.frame(vec![]);
+    h.click("Удалить из сборки");
+    let file = instance::instance_mines(&h.root, "26.3 fabric").join("mods/gone.jar");
+    assert!(!file.exists());
+    assert!(!h.has("Удалить из сборки"), "the card shows it is not installed any more");
+}
+
+#[test]
+fn the_cart_checks_compatibility_and_installs_what_fits() {
+    let _g = lock();
+    let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
+    let base = h.mock.url();
+    let a_v = version_with("a1", "AAA", "1.0", "2026-01-01T00:00:00Z", "", "", &format!("{base}/files/a.jar"), "a.jar", b"aaa");
+    h.mock.set(vec![
+        route("/search", 200, search_json(&[("AAA", "Fits"), ("BBB", "Nothing For You")])),
+        route("/project/AAA/version", 200, format!("[{a_v}]")),
+        route("/project/BBB/version", 200, "[]"),
+        route("/version_files", 200, "{}"),
+        route("/projects", 200, "[]"),
+        route("/files/a.jar", 200, "aaa"),
+    ]);
+    h.click("Каталог");
+    h.wait("search", 10, |a| a.mods.searched);
+    h.click_nth("В корзину", 0);
+    h.click_nth("В корзину", 0);
+    assert_eq!(h.app.cart.items.len(), 2, "screen: {:?}", h.labels());
+    h.click("Корзина · 2");
+    h.wait("checked", 10, |a| a.cart.fit.len() == 2 && a.cart.job.is_none());
+    h.frame(vec![]);
+    assert!(h.has("Установить всё (1)"), "only the fitting project counts; screen: {:?}", h.labels());
+    h.click("Установить всё (1)");
+    h.wait("installed", 20, |a| a.mod_install_job.is_none() && a.mod_install_report.is_some());
+    let mods = instance::instance_mines(&h.root, "26.3 fabric").join("mods");
+    assert!(mods.join("a.jar").exists());
+    assert_eq!(h.app.cart.items.len(), 1, "what was installed left the cart");
+    assert_eq!(h.app.cart.items[0].hit.project_id, "BBB");
+    h.click("Очистить");
+    assert!(h.app.cart.items.is_empty());
+}
+
+/// Pictures of the 1.0.3 card features with real Modrinth data (needs the internet):
+/// `LIMECRAFT_SNAPSHOT_DIR=<dir> cargo test snapshots_of_card_plus -- --ignored`
+#[test]
+#[ignore]
+fn snapshots_of_card_plus() {
+    let _g = lock();
+    let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
+    unsafe { std::env::remove_var("LIMECRAFT_MODRINTH_API") };
+    let settle = |h: &mut H, secs: u64| {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            h.frame(vec![]);
+        }
+    };
+    h.click("Каталог");
+    h.wait("search", 30, |a| a.mods.searched);
+    // the first few popular mods go into the cart
+    for _ in 0..3 {
+        h.click_nth("В корзину", 0);
+    }
+    // Iris needs Sodium: look at its dependencies
+    let hit = h.app.mods.results.iter().find(|x| x.title.contains("Iris")).cloned().expect("Iris in the popular list");
+    h.app.open_project(&hit, project::ProjectKind::Content(mods::ContentKind::Mod), project::TAB_DEPS);
+    h.wait("card", 30, |a| a.project_view.as_ref().is_some_and(|v| v.project_job.is_none() && v.versions_job.is_none()));
+    h.wait("deps", 30, |a| a.project_view.as_ref().is_some_and(|v| v.deps.is_some()));
+    settle(&mut h, 3);
+    h.snapshot("d1-deps");
+    h.click("Версии");
+    settle(&mut h, 1);
+    let first = h.app.project_view.as_ref().unwrap().versions[0].id.clone();
+    if h.has(&format!("changes:{first}")) {
+        h.click(&format!("changes:{first}"));
+    }
+    settle(&mut h, 1);
+    h.snapshot("d2-changes");
+    h.click("Назад в каталог");
+    h.click("Корзина · 3");
+    settle(&mut h, 6);
+    h.snapshot("d3-cart");
+}

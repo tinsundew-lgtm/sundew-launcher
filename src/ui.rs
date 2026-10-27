@@ -92,6 +92,11 @@ icons! {
     Star = '\u{E46A}', false;
     StarFill = '\u{E46A}', true;
     Funnel = '\u{E266}', false;
+    Cart = '\u{E41E}', false;
+    CartFill = '\u{E41E}', true;
+    CaretDown = '\u{E136}', false;
+    CaretUp = '\u{E13C}', false;
+    Tree = '\u{E67C}', false;
 }
 
 /// Draw `icon` centered in `rect`. The glyph is centered by its visible

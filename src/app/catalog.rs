@@ -743,6 +743,9 @@ impl LimeApp {
                         if favorite_button(ui, fav) {
                             self.toggle_favorite(&hit);
                         }
+                        if !is_installed && self.cart_button(ui, &hit.project_id) {
+                            self.toggle_cart(&hit, pkind);
+                        }
                     });
                 });
             });

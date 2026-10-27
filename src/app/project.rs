@@ -22,7 +22,7 @@ pub(super) enum ProjectKind {
 }
 
 impl ProjectKind {
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             ProjectKind::Content(mods::ContentKind::Mod) => "Мод",
             ProjectKind::Content(mods::ContentKind::ResourcePack) => "Ресурспак",
@@ -43,7 +43,8 @@ impl ProjectKind {
 /// Card tabs.
 pub(super) const TAB_ABOUT: usize = 0;
 pub(super) const TAB_VERSIONS: usize = 1;
-pub(super) const TAB_GALLERY: usize = 2;
+pub(super) const TAB_DEPS: usize = 2;
+pub(super) const TAB_GALLERY: usize = 3;
 
 /// How many version rows are shown before «Показать ещё».
 const VERSIONS_PAGE: usize = 40;
@@ -73,6 +74,14 @@ pub(super) struct ProjectView {
     pub lightbox: Option<usize>,
     /// When the large picture changed (it fades in).
     pub lightbox_t0: f64,
+    /// Versions whose list of changes is open, and the changes read as Markdown.
+    pub expanded: std::collections::HashSet<String>,
+    pub changelogs: std::collections::HashMap<String, Vec<Block>>,
+    /// Dependencies tab: the version looked at, what was found, the request.
+    pub deps_version: Option<String>,
+    pub deps: Option<super::deps::Loaded>,
+    pub deps_job: Option<Job<super::deps::Loaded>>,
+    pub deps_error: Option<String>,
 }
 
 /// State of a remote picture.
@@ -228,6 +237,12 @@ impl LimeApp {
             versions_shown: VERSIONS_PAGE,
             lightbox: None,
             lightbox_t0: now,
+            expanded: Default::default(),
+            changelogs: Default::default(),
+            deps_version: None,
+            deps: None,
+            deps_job: None,
+            deps_error: None,
         };
         Self::load_project(&mut view);
         Self::load_versions(&mut view);
@@ -349,12 +364,8 @@ impl LimeApp {
                     }
                     // versions are not here yet: let the server pick the newest compatible one
                     None => {
-                        let (hit, saved_kind, saved_only) = (view.hit.clone(), self.content_kind, self.only_compatible);
-                        self.content_kind = kind;
-                        self.only_compatible = true;
-                        self.quick_install(&hit);
-                        self.content_kind = saved_kind;
-                        self.only_compatible = saved_only;
+                        let want = mods::Want { kind, project_id: view.hit.project_id.clone(), title: view.hit.title.clone(), version: None };
+                        self.install_wants(vec![want], false);
                         return;
                     }
                 };
@@ -404,12 +415,27 @@ impl LimeApp {
         self.draw_project_header(ui, &mut view);
         ui.add_space(10.0);
 
-        let tabs = [(Some(Icon::Info), "Описание"), (Some(Icon::Stack), "Версии"), (Some(Icon::Image), "Галерея")];
+        // a modpack has no dependencies tab; the others keep their order
+        let all = [
+            (TAB_ABOUT, Icon::Info, "Описание"),
+            (TAB_VERSIONS, Icon::Stack, "Версии"),
+            (TAB_DEPS, Icon::Tree, "Зависимости"),
+            (TAB_GALLERY, Icon::Image, "Галерея"),
+        ];
+        let shown: Vec<(usize, Icon, &str)> = all.iter().copied().filter(|t| t.0 != TAB_DEPS || view.kind != ProjectKind::Modpack).collect();
+        if !shown.iter().any(|t| t.0 == view.tab) {
+            view.tab = TAB_ABOUT;
+        }
+        let tabs: Vec<(Option<Icon>, &str)> = shown.iter().map(|t| (Some(t.1), t.2)).collect();
+        let mut sel = shown.iter().position(|t| t.0 == view.tab).unwrap_or(0);
         ui.horizontal(|ui| {
-            ui::pill_tabs(ui, &tabs, &mut view.tab);
+            if ui::pill_tabs(ui, &tabs, &mut sel) {
+                view.tab = shown[sel].0;
+            }
             ui.add_space(8.0);
             let count = |n: usize, busy: bool| if busy { String::new() } else { n.to_string() };
             let note = match view.tab {
+                TAB_DEPS => view.deps.as_ref().map(|d| d.items.len().to_string()).unwrap_or_default(),
                 TAB_VERSIONS => count(view.versions.len(), view.versions_job.is_some()),
                 TAB_GALLERY => count(view.gallery.len(), view.project_job.is_some()),
                 _ => String::new(),
@@ -421,6 +447,7 @@ impl LimeApp {
         ui.add_space(10.0);
         match view.tab {
             TAB_VERSIONS => self.draw_project_versions(ui, &mut view),
+            TAB_DEPS => self.draw_project_deps(ui, &mut view),
             TAB_GALLERY => self.draw_project_gallery(ui, &mut view),
             _ => self.draw_project_about(ui, &mut view),
         }
@@ -440,6 +467,8 @@ impl LimeApp {
         };
         let fav = self.is_favorite(&hit.project_id);
         let mut category_click: Option<String> = None;
+        let mut update_click: Option<modrinth::Version> = None;
+        let mut remove_path: Option<std::path::PathBuf> = None;
         ui::card().inner_margin(egui::Margin::same(16)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -516,9 +545,54 @@ impl LimeApp {
                         if super::catalog::favorite_button(ui, fav) {
                             self.toggle_favorite(&hit);
                         }
+                        if matches!(view.kind, ProjectKind::Content(_)) && !installed && self.cart_button(ui, &hit.project_id) {
+                            self.toggle_cart(&hit, view.kind);
+                        }
                     });
                 });
             });
+
+            // an installed project: its version, update and removal
+            if let Some(item) = self.installed_item(view.kind, &hit.project_id) {
+                ui.add_space(8.0);
+                let target = self.state.instances.get(self.active_index()).cloned();
+                let current = view.versions.iter().find(|v| v.files.iter().any(|f| f.hashes.get("sha1").is_some_and(|h| h.eq_ignore_ascii_case(&item.sha1))));
+                let newest = view.versions.iter().find(|v| version_fits(v, view.kind, target.as_ref()));
+                let update = newest.filter(|n| match current {
+                    Some(c) => c.id != n.id && n.date_published > c.date_published,
+                    None => view.versions_job.is_none() && !view.versions.is_empty(),
+                });
+                let mut do_update: Option<modrinth::Version> = None;
+                let mut do_remove = false;
+                ui.horizontal_wrapped(|ui| {
+                    let have = current.map(|c| c.version_number.clone()).or(item.version_number.clone()).unwrap_or_else(|| item.file_name.clone());
+                    ui.label(RichText::new(format!("В сборке: {}", truncate(&have, 40))).color(theme::text()).size(13.0));
+                    if !item.enabled {
+                        ui::chip(ui, "выключен", theme::yellow());
+                    }
+                    match update {
+                        Some(n) => {
+                            let label = format!("Обновить до {}", truncate(&n.version_number, 30));
+                            if ui::button(ui, ui::BtnKind::Primary, Some(Icon::Up), &label, !busy).clicked() {
+                                do_update = Some(n.clone());
+                            }
+                        }
+                        None if view.versions_job.is_none() && current.is_some() => {
+                            ui.label(RichText::new("· это самая новая версия для сборки").color(theme::muted()).size(13.0));
+                        }
+                        None => {}
+                    }
+                    if ui::button(ui, ui::BtnKind::Danger, Some(Icon::Trash), "Удалить из сборки", !busy).clicked() {
+                        do_remove = true;
+                    }
+                });
+                if let Some(v) = do_update {
+                    update_click = Some(v);
+                }
+                if do_remove {
+                    remove_path = Some(item.path.clone());
+                }
+            }
 
             // where it goes
             ui.add_space(8.0);
@@ -557,6 +631,14 @@ impl LimeApp {
             }
         });
 
+        if let Some(v) = update_click {
+            self.install_from_card(view, Some(v));
+        }
+        if let Some(path) = remove_path {
+            if let Some(idx) = self.installed_items.iter().position(|i| i.path == path) {
+                self.remove_item(idx);
+            }
+        }
         if let Some(c) = category_click {
             self.filter_by_category(view.kind, &c);
             return;
@@ -620,7 +702,7 @@ impl LimeApp {
         });
     }
 
-    fn draw_markdown(&mut self, ui: &mut egui::Ui, blocks: &[Block]) {
+    pub(super) fn draw_markdown(&mut self, ui: &mut egui::Ui, blocks: &[Block]) {
         ui.spacing_mut().item_spacing.y = 6.0;
         let mut i = 0;
         while i < blocks.len() {
@@ -805,8 +887,9 @@ impl LimeApp {
         }
         let total = list.len();
         let busy = self.mod_install_job.is_some() || self.pack_install_job.is_some();
-        let installed_version = self.installed_item(view.kind, &view.hit.project_id).and_then(|i| i.version_number);
+        let installed_sha = self.installed_item(view.kind, &view.hit.project_id).map(|i| i.sha1);
         let mut install: Option<modrinth::Version> = None;
+        let mut toggled: Option<String> = None;
         ui::card().inner_margin(egui::Margin::same(6)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             for (n, v) in list.iter().take(view.versions_shown).enumerate() {
@@ -816,12 +899,32 @@ impl LimeApp {
                     ui.painter().hline((r.left() + 8.0)..=(r.right() - 8.0), y, Stroke::new(1.0, theme::divider()));
                 }
                 let fits = version_fits(v, view.kind, target.as_ref());
-                let here = installed_version.as_deref() == Some(v.version_number.as_str());
-                if version_row(ui, v, fits, here, show_loaders, busy) {
+                let here = installed_sha.as_deref().is_some_and(|s| v.files.iter().any(|f| f.hashes.get("sha1").is_some_and(|h| h.eq_ignore_ascii_case(s))));
+                let has_notes = v.changelog.as_deref().is_some_and(|c| !c.trim().is_empty());
+                let open = view.expanded.contains(&v.id);
+                let act = version_row(ui, v, fits, here, show_loaders, busy, has_notes, open);
+                if act.install {
                     install = Some((*v).clone());
+                }
+                if act.toggle {
+                    toggled = Some(v.id.clone());
+                }
+                if open && has_notes {
+                    let blocks = view.changelogs.entry(v.id.clone()).or_insert_with(|| markdown::parse(v.changelog.as_deref().unwrap_or("")));
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin { left: 18, right: 12, top: 0, bottom: 10 })
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            self.draw_markdown(ui, blocks);
+                        });
                 }
             }
         });
+        if let Some(id) = toggled {
+            if !view.expanded.remove(&id) {
+                view.expanded.insert(id);
+            }
+        }
         if total > view.versions_shown {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -1044,8 +1147,16 @@ impl LimeApp {
 
 /// One row of the versions list. Returns true when its install key was pressed.
 /// `installed`: this very version is in the target instance.
-fn version_row(ui: &mut egui::Ui, v: &modrinth::Version, fits: bool, installed: bool, show_loaders: bool, busy: bool) -> bool {
-    let mut clicked = false;
+/// What a click in a version row asked for.
+#[derive(Default)]
+struct RowAction {
+    install: bool,
+    toggle: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn version_row(ui: &mut egui::Ui, v: &modrinth::Version, fits: bool, installed: bool, show_loaders: bool, busy: bool, has_notes: bool, notes_open: bool) -> RowAction {
+    let mut act = RowAction::default();
     let fill = if fits { theme::mix(theme::card(), theme::green(), 0.10) } else { egui::Color32::TRANSPARENT };
     let out = egui::Frame::new()
         .fill(fill)
@@ -1076,6 +1187,14 @@ fn version_row(ui: &mut egui::Ui, v: &modrinth::Version, fits: bool, installed: 
                                 ui::chip(ui, &loader_name(l), theme::text());
                             }
                         }
+                        if has_notes {
+                            let icon = if notes_open { Icon::CaretUp } else { Icon::CaretDown };
+                            let r = ui::toggle_chip(ui, "Изменения", notes_open, Some(icon));
+                            ui::reg(&format!("changes:{}", v.id), r.rect);
+                            if r.clicked() {
+                                act.toggle = true;
+                            }
+                        }
                         let games = game_versions_label(&v.game_versions);
                         if !games.is_empty() {
                             ui.label(RichText::new(format!("Minecraft {games}")).color(theme::muted()).size(12.5))
@@ -1092,7 +1211,7 @@ fn version_row(ui: &mut egui::Ui, v: &modrinth::Version, fits: bool, installed: 
                     } else {
                         ui::icon_key(ui, Icon::Download, kind, "Установить эту версию")
                     };
-                    clicked = resp.clicked();
+                    act.install = resp.clicked();
                     ui.add_space(6.0);
                     let size = v.primary_file().map(|f| f.size).filter(|s| *s > 0).map(super::format_size).unwrap_or_default();
                     ui.vertical(|ui| {
@@ -1118,7 +1237,7 @@ fn version_row(ui: &mut egui::Ui, v: &modrinth::Version, fits: bool, installed: 
         let r = out.response.rect;
         ui.painter().rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(3.0, r.height())), 0.0, theme::green());
     }
-    clicked
+    act
 }
 
 /// Inline text of a description: labels and links that wrap together.

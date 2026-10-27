@@ -75,6 +75,9 @@ pub struct Version {
     pub date_published: String,
     #[serde(default)]
     pub downloads: u64,
+    /// What the author wrote about this version (Markdown).
+    #[serde(default)]
+    pub changelog: Option<String>,
 }
 
 impl Version {
