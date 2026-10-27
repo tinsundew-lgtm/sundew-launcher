@@ -36,6 +36,7 @@ cp target/release/limecraft-launcher dist/
 strip dist/limecraft-launcher || true
 cp assets/icon-256.png dist/limecraft.png
 cp packaging/linux/limecraft.desktop packaging/linux/install.sh packaging/linux/uninstall.sh dist/
+grep -m1 '^version' Cargo.toml | cut -d'"' -f2 > dist/VERSION
 chmod +x dist/limecraft-launcher dist/install.sh dist/uninstall.sh
 echo
 echo "Done: ./dist/limecraft-launcher"

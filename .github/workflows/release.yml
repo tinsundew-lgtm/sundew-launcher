@@ -56,6 +56,7 @@ jobs:
           cp README.md CHANGELOG.md LICENSE "$DIR/"
           cp assets/fonts/PHOSPHOR-LICENSE-MIT.txt "$DIR/licenses/Phosphor-Icons-MIT.txt"
           cp assets/fonts/Manrope-OFL.txt "$DIR/licenses/Manrope-OFL.txt"
+          echo "$VERSION" > "$DIR/VERSION"
           chmod +x "$DIR/limecraft-launcher" "$DIR/install.sh" "$DIR/uninstall.sh"
           tar -czf "$DIR.tar.gz" "$DIR"
           sha256sum "$DIR.tar.gz" > "$DIR.tar.gz.sha256"
@@ -110,10 +111,25 @@ jobs:
           (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash.ToLower() + "  $dir.zip" | Out-File -Encoding ascii "$dir.zip.sha256"
           "ARCHIVE=$dir.zip" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
 
+      - name: Installer
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; if ($LASTEXITCODE -ne 0) { exit 1 } }
+          & $iscc /Q "/DAppVersion=$version" "/DSourceExe=$PWD\target\release\limecraft-launcher.exe" packaging\windows\limecraft.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $setup = "LimeCraft-$version-setup-x64.exe"
+          Move-Item "dist/$setup" $setup
+          (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower() + "  $setup" | Out-File -Encoding ascii "$setup.sha256"
+          "SETUP=$setup" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+
       - uses: actions/upload-artifact@v4
         with:
           name: LimeCraft-windows
           path: |
+            ${{ env.SETUP }}
+            ${{ env.SETUP }}.sha256
             ${{ env.ARCHIVE }}
             ${{ env.ARCHIVE }}.sha256
 
@@ -122,5 +138,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            ${{ env.SETUP }}
+            ${{ env.SETUP }}.sha256
             ${{ env.ARCHIVE }}
             ${{ env.ARCHIVE }}.sha256
