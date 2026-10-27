@@ -282,6 +282,8 @@ pub struct LimeApp {
     inst_nick: String,
     /// Test hook: the answer of the next file dialog.
     pick_override: Option<PathBuf>,
+    /// Test hook: links are written here instead of being opened in the browser.
+    opened_links: Option<Vec<String>>,
     /// Instance being launched (for the after-launch behaviour).
     launching: Option<String>,
     profile_menu: bool,
@@ -461,6 +463,7 @@ impl LimeApp {
             inst_pinned: false,
             inst_nick: String::new(),
             pick_override: None,
+            opened_links: None,
             launching: None,
             profile_menu: false,
             chip_rect: None,
@@ -675,6 +678,45 @@ impl LimeApp {
         }
         if let Some(idx) = self.confirm_delete {
             self.draw_confirm_delete(ui.ctx(), idx);
+        }
+
+        // links are opened by the launcher itself: egui's own way silently fails on some Windows setups
+        let links = ui.ctx().output_mut(|o| {
+            let mut links = Vec::new();
+            o.commands.retain(|c| match c {
+                egui::OutputCommand::OpenUrl(open) => {
+                    links.push(open.url.clone());
+                    false
+                }
+                _ => true,
+            });
+            links
+        });
+        for url in links {
+            self.open_link(&url);
+        }
+    }
+
+    /// Open a web page in the default browser (only http/https links).
+    fn open_link(&mut self, url: &str) {
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return;
+        }
+        if let Some(log) = self.opened_links.as_mut() {
+            log.push(url.to_string());
+            return;
+        }
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("rundll32.exe");
+            c.arg("url.dll,FileProtocolHandler");
+            c
+        } else if cfg!(target_os = "macos") {
+            std::process::Command::new("open")
+        } else {
+            std::process::Command::new("xdg-open")
+        };
+        if let Err(e) = cmd.arg(url).spawn() {
+            self.toast = Some(format!("Не удалось открыть браузер ({e}). Ссылка: {url}"));
         }
     }
 }

@@ -1250,3 +1250,25 @@ fn snapshots_of_project_cards() {
     settle(&mut h, 2);
     h.snapshot("3-a-modpack-about-soft");
 }
+
+#[test]
+fn the_modrinth_button_opens_the_project_page_in_the_browser() {
+    let _g = lock();
+    let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
+    let base = h.mock.url();
+    h.mock.set(vec![
+        route("/search", 200, search_json(&[("AAA", "Sodium")])),
+        route("/project/AAA/version", 200, "[]"),
+        route("/project/AAA", 200, project_json("AAA", "mod", &base)),
+    ]);
+    h.app.opened_links = Some(Vec::new());
+    h.click("Каталог");
+    h.wait("search", 10, |a| a.mod_searched);
+    h.click("card:AAA");
+    h.wait("card", 10, |a| a.project_view.as_ref().is_some_and(|v| v.project.is_some()));
+    h.click("Modrinth");
+    assert_eq!(h.app.opened_links.as_deref(), Some(&["https://modrinth.com/mod/AAA".to_string()][..]));
+    // links inside the description go the same way
+    h.app.open_link("javascript:alert(1)");
+    assert_eq!(h.app.opened_links.as_ref().unwrap().len(), 1, "only web links are opened");
+}
