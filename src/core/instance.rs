@@ -71,6 +71,9 @@ pub struct LauncherState {
     /// Offline skin library (pictures in `<data>/skins`).
     #[serde(default)]
     pub skins: Vec<super::skins::Skin>,
+    /// Catalog projects marked with a star (kept as they were found, for the «Избранное» list).
+    #[serde(default)]
+    pub favorites: Vec<super::modrinth::SearchHit>,
 }
 
 impl LauncherState {

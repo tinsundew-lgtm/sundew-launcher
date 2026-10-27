@@ -6,7 +6,7 @@ use super::*;
 use eframe::egui::{Color32, Event, Key, Modifiers, PointerButton, Pos2, RawInput, Rect};
 use std::sync::atomic::AtomicUsize;
 
-use crate::testsupport::{Mock, route};
+use crate::testsupport::{Mock, route, route_seq};
 
 // ------------------------------------------------------------------ fixtures
 
@@ -212,8 +212,8 @@ fn catalog_opens_with_popular_results_and_install_buttons() {
     h.mock.set(vec![route("/search", 200, search_json(&[("AAA", "Sodium"), ("BBB", "Lithium")]))]);
 
     h.click("Каталог");
-    h.wait("auto search finished", 10, |a| a.mod_searched);
-    assert_eq!(h.app.mod_results.len(), 2, "results should appear without pressing anything");
+    h.wait("auto search finished", 10, |a| a.mods.searched);
+    assert_eq!(h.app.mods.results.len(), 2, "results should appear without pressing anything");
     assert_eq!(h.rects("Установить").len(), 2, "one install button per card; screen: {:?}", h.labels());
 
     // the request must carry the instance's compatibility filters
@@ -230,13 +230,13 @@ fn typing_a_query_and_pressing_enter_searches() {
     let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
     h.mock.set(vec![route("/search", 200, search_json(&[("AAA", "Sodium")]))]);
     h.click("Каталог");
-    h.wait("first search", 10, |a| a.mod_searched);
+    h.wait("first search", 10, |a| a.mods.searched);
 
     h.click("field:mods-search");
     h.type_text("sodium");
-    assert_eq!(h.app.mod_search_query, "sodium", "text must reach the search field");
+    assert_eq!(h.app.mods.query, "sodium", "text must reach the search field");
     h.press(Key::Enter);
-    h.wait("second search", 10, |a| a.mod_search_job.is_none());
+    h.wait("second search", 10, |a| a.mods.job.is_none());
     let s = h.searches();
     assert_eq!(s.len(), 2, "Enter must start a search: {s:?}");
     assert!(s[1].contains("query=sodium"), "{}", s[1]);
@@ -248,11 +248,11 @@ fn search_button_works_too() {
     let mut h = H::new(vec![]);
     h.mock.set(vec![route("/search", 200, search_json(&[("AAA", "Sodium")]))]);
     h.click("Каталог");
-    h.wait("first search", 10, |a| a.mod_searched);
+    h.wait("first search", 10, |a| a.mods.searched);
     h.click("field:mods-search");
     h.type_text("iris");
     h.click("Найти");
-    h.wait("button search", 10, |a| a.mod_search_job.is_none());
+    h.wait("button search", 10, |a| a.mods.job.is_none());
     assert!(h.searches().iter().any(|s| s.contains("query=iris")), "{:?}", h.searches());
 }
 
@@ -262,14 +262,14 @@ fn network_error_is_shown_inline_with_retry() {
     let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
     h.mock.set(vec![route("/search", 500, "{}")]);
     h.click("Каталог");
-    h.wait("error", 20, |a| a.mod_search_error.is_some());
+    h.wait("error", 20, |a| a.mods.error.is_some());
     assert!(h.has("Повторить"), "error banner with retry expected; screen: {:?}", h.labels());
 
     // server recovers -> Retry works
     h.mock.set(vec![route("/search", 200, search_json(&[("AAA", "Sodium")]))]);
     h.click("Повторить");
-    h.wait("recovered", 10, |a| a.mod_searched && a.mod_search_error.is_none());
-    assert_eq!(h.app.mod_results.len(), 1);
+    h.wait("recovered", 10, |a| a.mods.searched && a.mods.error.is_none());
+    assert_eq!(h.app.mods.results.len(), 1);
     assert!(!h.has("Повторить"));
 }
 
@@ -279,9 +279,9 @@ fn empty_result_says_nothing_found() {
     let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
     h.mock.set(vec![route("/search", 200, search_json(&[]))]);
     h.click("Каталог");
-    h.wait("search", 10, |a| a.mod_searched);
-    assert!(h.app.mod_results.is_empty());
-    assert!(h.app.mod_search_error.is_none());
+    h.wait("search", 10, |a| a.mods.searched);
+    assert!(h.app.mods.results.is_empty());
+    assert!(h.app.mods.error.is_none());
 }
 
 #[test]
@@ -290,10 +290,10 @@ fn modpack_tab_searches_and_offers_install() {
     let mut h = H::new(vec![]);
     h.mock.set(vec![route("/search", 200, search_json(&[("PPP", "Fabulously Optimized"), ("QQQ", "Cobblemon")]))]);
     h.click("Каталог");
-    h.wait("catalog search", 10, |a| a.mod_searched);
+    h.wait("catalog search", 10, |a| a.mods.searched);
     h.click("Модпаки");
-    h.wait("modpack search", 10, |a| a.pack_searched);
-    assert_eq!(h.app.pack_results.len(), 2);
+    h.wait("modpack search", 10, |a| a.packs.searched);
+    assert_eq!(h.app.packs.results.len(), 2);
     assert!(h.searches().iter().any(|s| decoded(s).contains("project_type:modpack")), "{:?}", h.searches());
 
     h.click_nth("Установить", 0);
@@ -307,13 +307,13 @@ fn modpack_search_by_enter() {
     let mut h = H::new(vec![]);
     h.mock.set(vec![route("/search", 200, search_json(&[("PPP", "Fabulously Optimized")]))]);
     h.click("Каталог");
-    h.wait("catalog search", 10, |a| a.mod_searched);
+    h.wait("catalog search", 10, |a| a.mods.searched);
     h.click("Модпаки");
-    h.wait("modpack search", 10, |a| a.pack_searched);
+    h.wait("modpack search", 10, |a| a.packs.searched);
     h.click("field:packs-search");
     h.type_text("skyblock");
     h.press(Key::Enter);
-    h.wait("enter search", 10, |a| a.pack_search_job.is_none());
+    h.wait("enter search", 10, |a| a.packs.job.is_none());
     assert!(h.searches().iter().any(|s| s.contains("query=skyblock")), "{:?}", h.searches());
 }
 
@@ -330,7 +330,7 @@ fn one_click_install_downloads_the_mod_into_the_instance() {
         route("/files/sodium.jar", 200, jar.clone()),
     ]);
     h.click("Каталог");
-    h.wait("search", 10, |a| a.mod_searched);
+    h.wait("search", 10, |a| a.mods.searched);
     h.click("Установить");
     h.wait("install finished", 20, |a| a.mod_install_job.is_none() && a.mod_install_report.is_some());
 
@@ -358,7 +358,7 @@ fn install_pulls_required_dependency() {
         route("/files/dep.jar", 200, jar_b.clone()),
     ]);
     h.click("Каталог");
-    h.wait("search", 10, |a| a.mod_searched);
+    h.wait("search", 10, |a| a.mods.searched);
     h.click("Установить");
     h.wait("install finished", 20, |a| a.mod_install_job.is_none() && a.mod_install_report.is_some());
     let mods = instance::instance_mines(&h.root, "26.3 fabric").join("mods");
@@ -379,7 +379,7 @@ fn install_without_loader_is_refused_with_explanation() {
         route("/files/x.jar", 200, jar),
     ]);
     h.click("Каталог");
-    h.wait("search", 10, |a| a.mod_searched);
+    h.wait("search", 10, |a| a.mods.searched);
     h.click("Установить");
     h.wait("install result", 20, |a| a.mod_install_job.is_none());
     let toast = h.app.toast.clone().unwrap_or_default();
@@ -404,7 +404,7 @@ fn every_page_renders_at_several_window_sizes() {
             h.click_nth(tab, last);
         }
         h.click("Каталог");
-        h.wait("catalog", 10, |a| a.mod_searched || a.mod_search_error.is_some());
+        h.wait("catalog", 10, |a| a.mods.searched || a.mods.error.is_some());
         for tab in ["Установленные", "Модпаки", "Каталог"] {
             let last = h.rects(tab).len() - 1; // "Каталог" is also a top-bar tab
             h.click_nth(tab, last);
@@ -506,7 +506,7 @@ fn disabled_buttons_ignore_clicks() {
     // install buttons are disabled while an install is running
     h.mock.set(vec![route("/search", 200, search_json(&[("AAA", "Sodium")]))]);
     h.click("Каталог");
-    h.wait("search", 10, |a| a.mod_searched);
+    h.wait("search", 10, |a| a.mods.searched);
     let running: Job<mods::InstallReport> = Arc::new(Mutex::new(None));
     h.app.mod_install_job = Some(running.clone());
     h.frame(vec![]);
@@ -530,7 +530,7 @@ fn catalog_shows_project_icons() {
     );
     h.mock.set(vec![route("/search", 200, hits), route("/icons/sodium.png", 200, png)]);
     h.click("Каталог");
-    h.wait("search", 10, |a| a.mod_searched);
+    h.wait("search", 10, |a| a.mods.searched);
     h.wait("icon loaded", 10, |a| matches!(a.pics.get(&format!("u:{icon}")), Some(Some(_))));
     assert!(h.mock.requests().iter().any(|r| r.contains("/icons/sodium.png")));
     // cached on disk for the next start
@@ -769,8 +769,8 @@ fn skins_tab_adds_equips_removes_and_puts_the_skin_into_the_game() {
     // the mod hint opens the catalog with the search filled in
     h.click("Найти мод");
     assert_eq!(h.app.page, Page::Mods);
-    assert_eq!(h.app.mod_search_query, "CustomSkinLoader");
-    h.wait("catalog search", 10, |a| a.mod_searched);
+    assert_eq!(h.app.mods.query, "CustomSkinLoader");
+    h.wait("catalog search", 10, |a| a.mods.searched);
 
     // deleting from the library also frees the profile
     h.click("Скины");
@@ -1101,7 +1101,7 @@ fn a_catalog_card_opens_the_project_with_description_versions_and_gallery() {
         route("/files/fit.jar", 200, jar.clone()),
     ]);
     h.click("Каталог");
-    h.wait("search", 10, |a| a.mod_searched);
+    h.wait("search", 10, |a| a.mods.searched);
 
     // a click on the card itself (not on its buttons) opens the project
     h.click("card:AAA");
@@ -1143,7 +1143,7 @@ fn a_catalog_card_opens_the_project_with_description_versions_and_gallery() {
 
     h.click("Назад в каталог");
     assert_eq!(h.app.page, Page::Mods);
-    assert_eq!(h.app.mod_results.len(), 1, "the catalog keeps its results");
+    assert_eq!(h.app.mods.results.len(), 1, "the catalog keeps its results");
 }
 
 #[test]
@@ -1160,10 +1160,10 @@ fn every_kind_of_project_has_a_card() {
         route("/img/", 200, png_bytes(32, 18, [1, 2, 3])),
     ]);
     h.click("Каталог");
-    h.wait("search", 10, |a| a.mod_searched);
+    h.wait("search", 10, |a| a.mods.searched);
     for (tab, kind) in [("Ресурспаки", mods::ContentKind::ResourcePack), ("Шейдеры", mods::ContentKind::Shader), ("Моды", mods::ContentKind::Mod)] {
         h.click(tab);
-        h.wait("search", 10, |a| a.mod_searched && a.content_kind == kind);
+        h.wait("search", 10, |a| a.mods.searched && a.content_kind == kind);
         h.click("card:AAA");
         h.wait("card loaded", 10, |a| a.project_view.as_ref().is_some_and(|v| v.project.is_some() && v.versions_job.is_none()));
         assert_eq!(h.app.project_view.as_ref().unwrap().kind, project::ProjectKind::Content(kind));
@@ -1175,7 +1175,7 @@ fn every_kind_of_project_has_a_card() {
 
     // modpacks: «Версии» opens the card on its versions; a chosen version installs from its own .mrpack
     h.click("Модпаки");
-    h.wait("modpack search", 10, |a| a.pack_searched);
+    h.wait("modpack search", 10, |a| a.packs.searched);
     h.click("Версии");
     assert_eq!(h.app.page, Page::Project);
     let view = h.app.project_view.as_ref().unwrap();
@@ -1205,8 +1205,8 @@ fn snapshots_of_project_cards() {
     for (n, (kind_tab, slug)) in [("Моды", "sodium"), ("Шейдеры", "complementary-reimagined"), ("Ресурспаки", "fresh-animations")].iter().enumerate() {
         h.click("Каталог");
         h.click(kind_tab);
-        h.wait("search", 30, |a| a.mod_searched);
-        let mut hit = h.app.mod_results.first().cloned().expect("results");
+        h.wait("search", 30, |a| a.mods.searched);
+        let mut hit = h.app.mods.results.first().cloned().expect("results");
         if let Ok(p) = modrinth::get_project(&install::make_client(), slug) {
             hit.project_id = p.id;
             hit.title = p.title;
@@ -1238,7 +1238,7 @@ fn snapshots_of_project_cards() {
         h.click("Назад в каталог");
     }
     h.click("Модпаки");
-    h.wait("packs", 30, |a| a.pack_searched);
+    h.wait("packs", 30, |a| a.packs.searched);
     h.click("Версии");
     h.wait("card", 30, loaded);
     settle(&mut h, 3);
@@ -1263,7 +1263,7 @@ fn the_modrinth_button_opens_the_project_page_in_the_browser() {
     ]);
     h.app.opened_links = Some(Vec::new());
     h.click("Каталог");
-    h.wait("search", 10, |a| a.mod_searched);
+    h.wait("search", 10, |a| a.mods.searched);
     h.click("card:AAA");
     h.wait("card", 10, |a| a.project_view.as_ref().is_some_and(|v| v.project.is_some()));
     h.click("Modrinth");
@@ -1272,3 +1272,263 @@ fn the_modrinth_button_opens_the_project_page_in_the_browser() {
     h.app.open_link("javascript:alert(1)");
     assert_eq!(h.app.opened_links.as_ref().unwrap().len(), 1, "only web links are opened");
 }
+
+// ------------------------------------------------------------------ catalog 2.0
+
+/// A search answer with `ids` as hits and `total` matches on the server.
+fn page_json(ids: &[String], total: usize) -> String {
+    let items: Vec<String> = ids.iter().map(|i| hit(i, &format!("Mod {i}"))).collect();
+    format!(r#"{{"hits":[{}],"total_hits":{total}}}"#, items.join(","))
+}
+
+fn last_search(h: &H) -> String {
+    decoded(h.searches().last().expect("a search was made"))
+}
+
+#[test]
+fn sorting_and_categories_change_the_search() {
+    let _g = lock();
+    let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
+    h.mock.set(vec![
+        route("/search", 200, search_json(&[("AAA", "Sodium")])),
+        route(
+            "/tag/category",
+            200,
+            r#"[{"icon":"<svg/>","name":"magic","project_type":"mod","header":"categories"},
+                {"icon":"<svg/>","name":"optimization","project_type":"mod","header":"categories"},
+                {"icon":"<svg/>","name":"shadows","project_type":"shader","header":"features"}]"#,
+        ),
+    ]);
+    h.click("Каталог");
+    h.wait("first search", 10, |a| a.mods.searched);
+    assert!(last_search(&h).contains("index=downloads"), "an empty query lists popular projects");
+
+    // sort order
+    h.click("sort");
+    h.click("sort:Новые");
+    h.wait("sorted search", 10, |a| !a.mods.busy());
+    assert!(last_search(&h).contains("index=newest"), "{}", last_search(&h));
+
+    // categories: the panel loads them, a chip filters, a click on a chosen one takes it away
+    h.click("Категории");
+    h.wait("categories loaded", 10, |a| !a.tags.busy());
+    h.frame(vec![]);
+    assert!(h.has("category:magic") && h.has("category:optimization"), "screen: {:?}", h.labels());
+    assert!(!h.has("category:shadows"), "only categories of mods");
+    h.click("category:magic");
+    h.wait("filtered search", 10, |a| !a.mods.busy());
+    let s = last_search(&h);
+    assert!(s.contains(r#"["categories:magic"]"#) && s.contains("index=newest"), "{s}");
+    h.click("category:optimization");
+    h.wait("second filter", 10, |a| !a.mods.busy());
+    let s = last_search(&h);
+    assert!(s.contains(r#"["categories:magic"],["categories:optimization"]"#), "every category must match: {s}");
+    h.click("selected:magic");
+    h.wait("one filter less", 10, |a| !a.mods.busy());
+    assert_eq!(h.app.mods.categories, ["optimization"]);
+    assert!(!last_search(&h).contains("categories:magic"));
+
+    // another content type starts without the categories of mods
+    h.click("Шейдеры");
+    h.wait("shader search", 10, |a| a.mods.searched && !a.mods.busy());
+    assert!(!last_search(&h).contains("categories:optimization"), "{}", last_search(&h));
+}
+
+#[test]
+fn the_next_page_loads_while_scrolling_down() {
+    let _g = lock();
+    let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
+    let first: Vec<String> = (0..20).map(|i| format!("P{i:02}")).collect();
+    let second: Vec<String> = (20..25).map(|i| format!("P{i:02}")).collect();
+    h.mock.set(vec![route_seq(
+        "/search",
+        vec![(200, page_json(&first, 25).into_bytes()), (200, page_json(&second, 25).into_bytes())],
+    )]);
+    h.click("Каталог");
+    h.wait("first page", 10, |a| a.mods.searched);
+    assert_eq!(h.app.mods.results.len(), 20);
+    assert!(h.app.mods.has_more());
+    assert_eq!(h.searches().len(), 1, "the end of the list is not in view yet");
+
+    for _ in 0..80 {
+        if h.app.mods.results.len() == 25 {
+            break;
+        }
+        h.frame(vec![Event::PointerMoved(Pos2::new(640.0, 500.0)), wheel(-600.0)]);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    h.wait("second page", 10, |a| a.mods.results.len() == 25);
+    let s = h.searches();
+    assert_eq!(s.len(), 2, "{s:?}");
+    assert!(s[1].contains("offset=20"), "{}", s[1]);
+    for _ in 0..10 {
+        h.frame(vec![wheel(-600.0)]);
+    }
+    assert!(!h.app.mods.has_more());
+    assert_eq!(h.searches().len(), 2, "nothing more is asked once everything is here");
+}
+
+/// Put a jar into the instance; returns the `/version_files` answer that makes Modrinth
+/// know it as version `number` of `project`.
+fn install_known_jar(h: &H, instance: &str, file: &str, bytes: &[u8], project: &str, number: &str) -> String {
+    let dir = instance::instance_mines(&h.root, instance).join("mods");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(file), bytes).unwrap();
+    let v = version_json("old", project, &format!("{}/files/{file}", h.mock.url()), file, bytes, "")
+        .replace(r#""version_number":"1.0.0""#, &format!(r#""version_number":"{number}""#));
+    format!(r#"{{"{}":{v}}}"#, sha1_hex(bytes))
+}
+
+#[test]
+fn installed_projects_are_marked_and_another_version_replaces_the_file() {
+    let _g = lock();
+    let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
+    let base = h.mock.url();
+    let known = install_known_jar(&h, "26.3 fabric", "sodium-1.jar", b"old-jar", "AAA", "1.0");
+    let new_jar = b"new-jar".to_vec();
+    let v2 = card_version("v2", "2.0", r#""26.3""#, r#""fabric""#, &format!("{base}/files/sodium-2.jar"), "sodium-2.jar", &new_jar);
+    let v1 = card_version("v1", "1.0", r#""26.3""#, r#""fabric""#, &format!("{base}/files/sodium-1.jar"), "sodium-1.jar", b"old-jar");
+    h.mock.set(vec![
+        route("/search", 200, search_json(&[("AAA", "Sodium"), ("BBB", "Lithium")])),
+        route("/version_files", 200, known),
+        route("/projects", 200, "[]"),
+        route("/project/AAA/version", 200, format!("[{v2},{v1}]")),
+        route("/project/AAA", 200, project_json("AAA", "mod", &base)),
+        route("/files/sodium-2.jar", 200, new_jar.clone()),
+    ]);
+    h.click("Каталог");
+    h.wait("search and installed list", 10, |a| a.mods.searched && a.installed_job.is_none() && !a.installed_items.is_empty());
+    h.frame(vec![]);
+    assert_eq!(h.rects("Установлено").len(), 1, "screen: {:?}", h.labels());
+    assert_eq!(h.rects("Установить").len(), 1, "only the other project can be installed");
+
+    // the card knows it too: the installed version is marked, another one replaces it
+    h.click("card:AAA");
+    h.wait("card", 10, |a| a.project_view.as_ref().is_some_and(|v| v.project.is_some() && v.versions_job.is_none()));
+    assert!(h.has("Установлено") && !h.has("Установить"), "screen: {:?}", h.labels());
+    h.click("Версии");
+    assert_eq!(h.rects("Установить эту версию").len(), 1, "the installed version has no install key");
+    h.click("Установить эту версию");
+    h.wait("replaced", 20, |a| a.mod_install_job.is_none() && a.mod_install_report.is_some());
+    let mods = instance::instance_mines(&h.root, "26.3 fabric").join("mods");
+    assert_eq!(std::fs::read(mods.join("sodium-2.jar")).expect("the new version"), new_jar);
+    assert!(!mods.join("sodium-1.jar").exists(), "the old file is gone: never two copies");
+}
+
+#[test]
+fn favorites_are_kept_and_listed_by_type() {
+    let _g = lock();
+    let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
+    let base = h.mock.url();
+    h.mock.set(vec![
+        route("/search", 200, search_json(&[("AAA", "Sodium"), ("BBB", "Lithium")])),
+        route("/project/BBB/version", 200, "[]"),
+        route("/project/BBB", 200, project_json("BBB", "mod", &base)),
+    ]);
+    h.click("Каталог");
+    h.wait("search", 10, |a| a.mods.searched);
+    h.click_nth("В избранное", 1);
+    assert_eq!(h.app.state.favorites.len(), 1);
+    assert_eq!(h.app.state.favorites[0].project_id, "BBB");
+    assert_eq!(instance::load_state(&h.root).favorites.len(), 1, "saved to disk");
+    assert_eq!(h.rects("Убрать из избранного").len(), 1);
+
+    h.click("Избранное");
+    assert!(h.has("card:BBB") && !h.has("card:AAA"), "screen: {:?}", h.labels());
+    h.click("card:BBB");
+    assert_eq!(h.app.page, Page::Project);
+    assert_eq!(h.app.project_view.as_ref().unwrap().kind, project::ProjectKind::Content(mods::ContentKind::Mod));
+    h.click("Убрать из избранного");
+    assert!(h.app.state.favorites.is_empty());
+    h.click("Назад в каталог");
+    assert!(!h.has("card:BBB"), "the list is empty now");
+}
+
+#[test]
+fn a_category_of_a_card_filters_the_catalog() {
+    let _g = lock();
+    let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
+    let base = h.mock.url();
+    h.mock.set(vec![
+        route("/search", 200, search_json(&[("AAA", "Sodium")])),
+        route("/project/AAA/version", 200, "[]"),
+        route("/project/AAA", 200, project_json("AAA", "mod", &base)),
+    ]);
+    h.click("Каталог");
+    h.wait("search", 10, |a| a.mods.searched);
+    h.click("card:AAA");
+    h.wait("card", 10, |a| a.project_view.as_ref().is_some_and(|v| v.project.is_some()));
+    h.click("card-category:optimization");
+    assert_eq!(h.app.page, Page::Mods);
+    assert_eq!(h.app.mods.categories, ["optimization"]);
+    h.wait("filtered search", 10, |a| !a.mods.busy());
+    assert!(last_search(&h).contains(r#"["categories:optimization"]"#), "{}", last_search(&h));
+    assert!(h.has("selected:optimization"), "the filter is shown and can be taken away");
+}
+
+/// Pictures of the catalog with real Modrinth data (needs the internet):
+/// `LIMECRAFT_SNAPSHOT_DIR=<dir> cargo test snapshots_of_the_catalog -- --ignored`
+#[test]
+#[ignore]
+fn snapshots_of_the_catalog() {
+    let _g = lock();
+    let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
+    unsafe { std::env::remove_var("LIMECRAFT_MODRINTH_API") };
+    let settle = |h: &mut H, secs: u64| {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            h.frame(vec![]);
+        }
+    };
+    h.click("Каталог");
+    h.wait("search", 30, |a| a.mods.searched);
+    h.click("categories:toggle");
+    h.wait("categories", 30, |a| !a.tags.busy());
+    h.click("category:optimization");
+    h.wait("filtered", 30, |a| !a.mods.busy());
+    settle(&mut h, 3);
+    h.snapshot("c1-filters-open");
+    h.click("categories:toggle");
+    h.click("sort");
+    settle(&mut h, 1);
+    h.snapshot("c2-sort-open");
+    h.click("sort:Обновлённые");
+    h.wait("sorted", 30, |a| !a.mods.busy());
+    h.click_nth("В избранное", 0);
+    h.click_nth("В избранное", 1);
+    settle(&mut h, 3);
+    h.snapshot("c3-sorted-with-stars");
+    // the end of the list: the next page comes in
+    for _ in 0..60 {
+        h.frame(vec![Event::PointerMoved(Pos2::new(640.0, 500.0)), wheel(-500.0)]);
+    }
+    settle(&mut h, 3);
+    h.snapshot("c4-scrolled");
+    for _ in 0..30 {
+        h.frame(vec![Event::PointerMoved(Pos2::new(640.0, 500.0)), wheel(5000.0)]);
+    }
+    settle(&mut h, 1);
+    h.click("Шейдеры");
+    h.wait("shaders", 30, |a| a.mods.searched && !a.mods.busy());
+    h.click("categories:toggle");
+    h.wait("categories", 30, |a| !a.tags.busy());
+    settle(&mut h, 3);
+    h.snapshot("c5-shader-categories");
+    h.click("Модпаки");
+    h.wait("packs", 30, |a| a.packs.searched);
+    h.click_nth("В избранное", 0);
+    settle(&mut h, 3);
+    h.snapshot("c6-modpacks");
+    h.click("Избранное");
+    settle(&mut h, 3);
+    h.snapshot("c7-favorites");
+    // the soft style
+    h.app.state.ui.style = prefs::UiStyle::Soft;
+    LimeApp::apply_prefs(&h.ctx, &h.app.state.ui);
+    h.click_nth("Каталог", 1);
+    h.click("category:shadows");
+    settle(&mut h, 2);
+    h.snapshot("c8-soft-filters");
+}
+

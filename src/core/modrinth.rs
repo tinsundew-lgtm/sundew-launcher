@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
 
@@ -15,7 +15,7 @@ pub fn api_base() -> String {
         .unwrap_or_else(|| DEFAULT_API_BASE.to_string())
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SearchHit {
     pub project_id: String,
     pub project_type: String,
@@ -251,34 +251,65 @@ pub fn get_versions_post(client: &reqwest::blocking::Client, ids: &[String]) -> 
     resp.json().map_err(|e| e.to_string())
 }
 
-/// Search with compatibility filters (game version / loader). An empty query
-/// browses by downloads, like the Modrinth site does.
-pub fn search_filtered(
-    client: &reqwest::blocking::Client,
-    query: &str,
-    project_type: &str,
-    game_version: Option<&str>,
-    loaders: &[&str],
-    limit: u32,
-    offset: u32,
-) -> Result<Vec<SearchHit>, String> {
-    let base = api_base();
-    let mut facets = vec![serde_json::json!([format!("project_type:{project_type}")])];
-    if let Some(v) = game_version.filter(|v| !v.is_empty() && *v != "latest") {
+/// One catalog search.
+pub struct SearchQuery<'a> {
+    pub query: &'a str,
+    pub project_type: &'a str,
+    /// Only projects for this game version.
+    pub game_version: Option<&'a str>,
+    /// Only projects for one of these loaders.
+    pub loaders: &'a [&'a str],
+    /// Only projects in every one of these categories.
+    pub categories: &'a [String],
+    /// Sort order: `relevance`, `downloads`, `follows`, `newest` or `updated`.
+    pub index: &'a str,
+    pub limit: u32,
+    pub offset: u32,
+}
+
+/// One page of catalog results. Without a query "relevance" means nothing, so the
+/// list is sorted by downloads then, like the Modrinth site does.
+pub fn search_page(client: &reqwest::blocking::Client, q: &SearchQuery) -> Result<SearchResponse, String> {
+    search_page_at(client, &api_base(), q)
+}
+
+fn search_page_at(client: &reqwest::blocking::Client, base: &str, q: &SearchQuery) -> Result<SearchResponse, String> {
+    let mut facets = vec![serde_json::json!([format!("project_type:{}", q.project_type)])];
+    if let Some(v) = q.game_version.filter(|v| !v.is_empty() && *v != "latest") {
         facets.push(serde_json::json!([format!("versions:{v}")]));
     }
-    if !loaders.is_empty() {
+    if !q.loaders.is_empty() {
         // any of the loaders (OR inside one facet group)
-        facets.push(serde_json::Value::Array(loaders.iter().map(|l| format!("categories:{l}").into()).collect()));
+        facets.push(serde_json::Value::Array(q.loaders.iter().map(|l| format!("categories:{l}").into()).collect()));
     }
-    let index = if query.trim().is_empty() { "downloads" } else { "relevance" };
+    for c in q.categories {
+        // every category (AND: one group each)
+        facets.push(serde_json::json!([format!("categories:{c}")]));
+    }
+    let index = if q.index == "relevance" && q.query.trim().is_empty() { "downloads" } else { q.index };
     let url = format!(
-        "{base}/search?query={}&facets={}&index={index}&limit={limit}&offset={offset}",
-        percent_encode(query.trim()),
+        "{base}/search?query={}&facets={}&index={index}&limit={}&offset={}",
+        percent_encode(q.query.trim()),
         percent_encode(&serde_json::Value::Array(facets).to_string()),
+        q.limit,
+        q.offset,
     );
-    let resp: SearchResponse = download::get_json(client, &url)?;
-    Ok(resp.hits)
+    download::get_json(client, &url)
+}
+
+/// A category of the catalog (`header` groups them: categories, features, resolutions...).
+#[derive(Debug, Deserialize, Clone)]
+pub struct CategoryTag {
+    pub name: String,
+    pub project_type: String,
+    #[serde(default)]
+    pub header: String,
+}
+
+/// Every category Modrinth knows.
+pub fn category_tags(client: &reqwest::blocking::Client) -> Result<Vec<CategoryTag>, String> {
+    let base = api_base();
+    download::get_json(client, &format!("{base}/tag/category"))
 }
 
 /// Fetch one version by id.
@@ -456,6 +487,38 @@ mod tests {
         assert_eq!(v.primary_file().unwrap().size, 2048);
         let pack = mrpack_of(&v).unwrap();
         assert_eq!((pack.url.as_str(), pack.sha1.as_deref()), ("https://cdn.modrinth.com/p.mrpack", Some("ab")));
+    }
+
+    #[test]
+    fn search_pages_carry_sort_categories_and_offset() {
+        use crate::testsupport::{Mock, route};
+        let m = Mock::start();
+        m.set(vec![route("/search", 200, r#"{"hits":[],"total_hits":42}"#)]);
+        let c = reqwest::blocking::Client::new();
+        let cats = vec!["magic".to_string(), "storage".to_string()];
+        let q = |query: &'static str, index: &'static str| SearchQuery {
+            query,
+            project_type: "mod",
+            game_version: Some("1.21.1"),
+            loaders: &["fabric", "quilt"],
+            categories: &cats,
+            index,
+            limit: 20,
+            offset: 40,
+        };
+        let r = search_page_at(&c, &m.url(), &q("", "relevance"));
+        let r2 = search_page_at(&c, &m.url(), &q("chest", "updated"));
+        assert_eq!(r.unwrap().total_hits, 42);
+        r2.unwrap();
+        let reqs: Vec<String> = m.requests().iter().map(|r| percent_encoding::percent_decode_str(r).decode_utf8_lossy().to_string()).collect();
+        assert!(reqs[0].contains("index=downloads"), "no query: popular first: {}", reqs[0]);
+        assert!(reqs[1].contains("index=updated") && reqs[1].contains("query=chest"), "{}", reqs[1]);
+        assert!(
+            reqs[0].contains(r#"[["project_type:mod"],["versions:1.21.1"],["categories:fabric","categories:quilt"],["categories:magic"],["categories:storage"]]"#),
+            "loaders are OR, categories AND: {}",
+            reqs[0]
+        );
+        assert!(reqs[0].contains("limit=20") && reqs[0].contains("offset=40"));
     }
 
     #[test]

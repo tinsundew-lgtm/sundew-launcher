@@ -53,6 +53,7 @@ enum ModsView {
     Catalog,
     Installed,
     Modpacks,
+    Favorites,
 }
 
 /// Run a blocking closure on a worker thread, exposing the result through a
@@ -200,25 +201,21 @@ pub struct LimeApp {
     only_compatible: bool,
 
     // ---- Modpacks ----
-    pack_search_query: String,
-    pack_search_job: Option<Job<Vec<modrinth::SearchHit>>>,
-    pack_results: Vec<modrinth::SearchHit>,
+    /// Modpack search (catalog list «Модпаки»).
+    packs: catalog::Browse,
     selected_pack: Option<usize>,
     pack_install_name: String,
     pack_install_prog: Option<Arc<install::InstallProgress>>,
     pack_install_job: Option<Job<instance::Instance>>,
 
     // ---- Mods ----
-    mod_search_query: String,
-    mod_search_job: Option<Job<Vec<modrinth::SearchHit>>>,
-    mod_results: Vec<modrinth::SearchHit>,
+    /// Content search (catalog list «Каталог»).
+    mods: catalog::Browse,
+    /// Modrinth categories for the filters.
+    tags: catalog::Tags,
     /// The open project card (page `Project`).
     project_view: Option<project::ProjectView>,
     mod_install_prog: Option<Arc<install::InstallProgress>>,
-    mod_searched: bool,
-    mod_search_error: Option<String>,
-    pack_searched: bool,
-    pack_search_error: Option<String>,
     mod_install_job: Option<Job<mods::InstallReport>>,
     mod_install_report: Option<String>,
 
@@ -395,24 +392,17 @@ impl LimeApp {
             mods_view: if std::env::var("LIMECRAFT_PAGE").as_deref() == Ok("installed") { ModsView::Installed } else { ModsView::Catalog },
             content_kind: mods::ContentKind::Mod,
             only_compatible: true,
-            pack_search_query: String::new(),
-            pack_search_job: None,
-            pack_results: Vec::new(),
+            packs: catalog::Browse::new(),
             selected_pack: None,
             pack_install_name: String::new(),
             pack_install_prog: None,
             pack_install_job: None,
-            mod_search_query: String::new(),
-            mod_search_job: None,
-            mod_results: Vec::new(),
+            mods: catalog::Browse::new(),
+            tags: Default::default(),
             project_view: None,
             mod_install_prog: None,
             mod_install_job: None,
             mod_install_report: None,
-            mod_searched: false,
-            mod_search_error: None,
-            pack_searched: false,
-            pack_search_error: None,
             installed_items: Vec::new(),
             installed_job: None,
             installed_for: None,
@@ -503,17 +493,16 @@ impl LimeApp {
 
     /// Forget catalog results (target instance or content type changed).
     fn reset_mod_search(&mut self) {
-        self.mod_results.clear();
-        self.mod_searched = false;
-        self.mod_search_error = None;
+        self.mods.reset();
         self.mod_install_report = None;
     }
 
     fn is_busy(&self) -> bool {
         self.versions_job.is_some()
-            || self.pack_search_job.is_some()
+            || self.packs.busy()
+            || self.tags.busy()
             || self.pack_install_job.is_some()
-            || self.mod_search_job.is_some()
+            || self.mods.busy()
             || self.project_view.as_ref().is_some_and(|v| v.project_job.is_some() || v.versions_job.is_some())
             || self.mod_install_job.is_some()
             || self.installed_job.is_some()
@@ -1078,21 +1067,11 @@ impl LimeApp {
             }
         }
 
-        // modpack search
-        if let Some(job) = &self.pack_search_job {
-            if let Some(res) = drain(job) {
-                self.pack_search_job = None;
-                match res {
-                    Ok(list) => {
-                        self.pack_results = list;
-                        self.selected_pack = None;
-                        self.pack_searched = true;
-                        self.pack_search_error = None;
-                    }
-                    Err(e) => self.pack_search_error = Some(e),
-                }
-            }
+        // catalog searches
+        if self.packs.poll() {
+            self.selected_pack = None;
         }
+        self.mods.poll();
 
         // modpack install
         if let Some(job) = &self.pack_install_job {
@@ -1107,21 +1086,6 @@ impl LimeApp {
                     Err(e) => {
                         self.toast = Some(format!("Ошибка установки модпака: {}", friendly(&e)));
                     }
-                }
-            }
-        }
-
-        // mod search
-        if let Some(job) = &self.mod_search_job {
-            if let Some(res) = drain(job) {
-                self.mod_search_job = None;
-                match res {
-                    Ok(list) => {
-                        self.mod_results = list;
-                        self.mod_searched = true;
-                        self.mod_search_error = None;
-                    }
-                    Err(e) => self.mod_search_error = Some(e),
                 }
             }
         }
@@ -2791,7 +2755,8 @@ impl LimeApp {
             });
         });
         if find {
-            self.mod_search_query = "CustomSkinLoader".to_string();
+            self.mods.query = "CustomSkinLoader".to_string();
+            self.mods.categories.clear();
             self.content_kind = mods::ContentKind::Mod;
             self.mods_view = ModsView::Catalog;
             self.reset_mod_search();
@@ -2997,133 +2962,6 @@ fn paint_skin_figure(ui: &egui::Ui, area: egui::Rect, tex: &egui::TextureHandle,
 // ------------------------------------------------------------------ Modpacks
 
 impl LimeApp {
-    fn draw_modpacks(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        if !self.pack_searched && self.pack_search_job.is_none() && self.pack_search_error.is_none() {
-            self.search_packs();
-        }
-
-        ui.horizontal(|ui| {
-            let w = (ui.available_width() - 120.0).max(200.0);
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.pack_search_query)
-                    .hint_text("Поиск модпаков (пусто — популярные)")
-                    .desired_width(w),
-            );
-            ui::reg("field:packs-search", resp.rect);
-            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui::primary(ui, Some(Icon::Search), "Найти") || enter {
-                self.search_packs();
-            }
-            if self.pack_search_job.is_some() {
-                ui.add(egui::Spinner::new());
-            }
-        });
-
-        ui.add_space(8.0);
-        if let Some(prog) = &self.pack_install_prog {
-            self.install_progress_bar(ui, prog, Some(&prog.cancelled));
-            ui.add_space(8.0);
-        }
-        if let Some(err) = self.pack_search_error.clone() {
-            if error_banner(ui, "Не удалось выполнить поиск", &err) {
-                self.pack_search_error = None;
-                self.search_packs();
-            }
-            ui.add_space(8.0);
-        }
-
-        // install panel for the chosen modpack
-        if let Some(hit) = self.selected_pack.and_then(|i| self.pack_results.get(i).cloned()) {
-            ui::card().stroke(Stroke::new(1.0, theme::green())).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(RichText::new(format!("Установить «{}»", hit.title)).size(16.0).family(ui::bold_family()));
-                ui.label(RichText::new("Имя новой сборки (пусто — как у модпака)").color(theme::muted()).size(12.0));
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.pack_install_name)
-                            .hint_text(hit.slug.clone().unwrap_or_else(|| hit.project_id.clone()))
-                            .desired_width(280.0),
-                    );
-                    let busy = self.pack_install_job.is_some();
-                    if ui::button(ui, ui::BtnKind::Primary, Some(Icon::Download), "Скачать и установить", !busy).clicked() {
-                        self.start_pack_install(&hit);
-                    }
-                    if ui::secondary(ui, None, "Отмена") {
-                        self.selected_pack = None;
-                    }
-                });
-            });
-            ui.add_space(8.0);
-        }
-
-        if self.pack_results.is_empty() {
-            ui.add_space(30.0);
-            let msg = if self.pack_search_job.is_some() {
-                "Ищем на Modrinth…"
-            } else if self.pack_search_error.is_some() {
-                ""
-            } else if self.pack_searched {
-                "Ничего не найдено. Попробуйте другой запрос."
-            } else {
-                "Нажмите «Найти» — без запроса покажем популярные модпаки."
-            };
-            ui.vertical_centered(|ui| {
-                if let Some(empty) = &self.assets.empty_state {
-                    ui.add(egui::Image::new(egui::load::SizedTexture::from_handle(empty)).max_size(egui::vec2(160.0, 120.0)));
-                }
-                ui.label(RichText::new(msg).color(theme::muted()));
-            });
-            return;
-        }
-
-        for idx in 0..self.pack_results.len() {
-            let hit = self.pack_results[idx].clone();
-            let selected = self.selected_pack == Some(idx);
-            let opened = catalog_card(ui, &hit.project_id, selected, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        self.project_icon(ui, &hit.title, hit.icon_url.as_deref(), 52.0);
-                        ui.vertical(|ui| {
-                            ui.set_max_width((ui.available_width() - 160.0).max(200.0));
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(&hit.title).size(16.0).family(ui::bold_family()));
-                                ui.label(RichText::new(format!("от {}", hit.author)).color(theme::muted()).size(12.5));
-                            });
-                            ui.label(RichText::new(truncate(&hit.description, 140)).color(theme::muted()).size(13.0));
-                            ui.label(
-                                RichText::new(format!("↓ {} · версий игры: {}", project::format_count(hit.downloads), hit.versions.len()))
-                                    .color(theme::muted())
-                                    .size(12.0),
-                            );
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let busy = self.pack_install_job.is_some();
-                            if ui::button(ui, ui::BtnKind::Primary, Some(Icon::Download), "Установить", !busy).clicked() {
-                                self.selected_pack = Some(idx);
-                            }
-                            if ui::secondary(ui, None, "Версии") {
-                                self.open_project(&hit, project::ProjectKind::Modpack, project::TAB_VERSIONS);
-                            }
-                        });
-                    });
-                });
-            if opened && self.page == Page::Mods {
-                self.open_project(&hit, project::ProjectKind::Modpack, project::TAB_ABOUT);
-            }
-            ui.add_space(4.0);
-        }
-    }
-
-    fn search_packs(&mut self) {
-        let query = self.pack_search_query.trim().to_string();
-        let client = install::make_client();
-        self.pack_search_error = None;
-        self.pack_search_job = Some(start_detached(&client, move |c| {
-            modrinth::search_filtered(c, &query, "modpack", None, &[], 20, 0)
-        }));
-    }
-
     fn start_pack_install(&mut self, hit: &modrinth::SearchHit) {
         let name = self.pack_install_name.trim().to_string();
         let name = if name.is_empty() {
@@ -3218,15 +3056,16 @@ impl LimeApp {
         ui.add_space(14.0);
         ui::heading(ui, "Каталог Modrinth");
         ui.add_space(8.0);
-        let views = [ModsView::Catalog, ModsView::Installed, ModsView::Modpacks];
+        let views = [ModsView::Catalog, ModsView::Installed, ModsView::Modpacks, ModsView::Favorites];
         let mut sel = views.iter().position(|v| *v == self.mods_view).unwrap_or(0);
-        let tabs = [(Some(Icon::Compass), "Каталог"), (Some(Icon::Cube), "Установленные"), (Some(Icon::Download), "Модпаки")];
+        let tabs = [(Some(Icon::Compass), "Каталог"), (Some(Icon::Cube), "Установленные"), (Some(Icon::Download), "Модпаки"), (Some(Icon::Star), "Избранное")];
         if ui::pill_tabs(ui, &tabs, &mut sel) {
             self.mods_view = views[sel];
         }
         ui.add_space(10.0);
         match self.mods_view {
             ModsView::Modpacks => self.draw_modpacks(ui),
+            ModsView::Favorites => self.draw_favorites(ui),
             ModsView::Catalog => {
                 self.draw_content_header(ui);
                 self.draw_mods_catalog(ui);
@@ -3283,109 +3122,6 @@ impl LimeApp {
         ui.add_space(8.0);
     }
 
-    fn draw_mods_catalog(&mut self, ui: &mut egui::Ui) {
-        let kind = self.content_kind;
-        // First open (or after switching instance/type): show popular items right away.
-        if !self.mod_searched && self.mod_search_job.is_none() && self.mod_search_error.is_none() {
-            self.search_mods();
-        }
-        let busy = self.mod_install_job.is_some();
-        ui.horizontal(|ui| {
-            let hint = match kind {
-                mods::ContentKind::Mod => "Поиск модов (пусто — популярные)",
-                mods::ContentKind::ResourcePack => "Поиск ресурспаков",
-                mods::ContentKind::Shader => "Поиск шейдеров",
-            };
-            let w = (ui.available_width() - 330.0).max(180.0);
-            let resp = ui.add(egui::TextEdit::singleline(&mut self.mod_search_query).hint_text(hint).desired_width(w));
-            ui::reg("field:mods-search", resp.rect);
-            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui::primary(ui, Some(Icon::Search), "Найти") || enter {
-                self.search_mods();
-            }
-            ui.checkbox(&mut self.only_compatible, "Только совместимые");
-            if self.mod_search_job.is_some() {
-                ui.add(egui::Spinner::new());
-            }
-        });
-
-        ui.add_space(8.0);
-        if let Some(prog) = &self.mod_install_prog {
-            self.install_progress_bar(ui, prog, Some(&prog.cancelled));
-            ui.add_space(8.0);
-        }
-        if let Some(report) = &self.mod_install_report {
-            ui.label(RichText::new(report).color(theme::success()));
-            ui.add_space(6.0);
-        }
-
-        if let Some(err) = self.mod_search_error.clone() {
-            if error_banner(ui, "Не удалось выполнить поиск", &err) {
-                self.mod_search_error = None;
-                self.search_mods();
-            }
-            ui.add_space(8.0);
-        }
-
-        if self.mod_results.is_empty() {
-            ui.add_space(30.0);
-            let msg = if self.mod_search_job.is_some() {
-                "Ищем на Modrinth…"
-            } else if self.mod_search_error.is_some() {
-                ""
-            } else if self.mod_searched {
-                "Ничего не найдено. Попробуйте другой запрос или снимите «Только совместимые»."
-            } else {
-                "Нажмите «Найти» — без запроса покажем популярное."
-            };
-            ui.vertical_centered(|ui| {
-                if let Some(empty) = &self.assets.empty_state {
-                    ui.add(egui::Image::new(egui::load::SizedTexture::from_handle(empty)).max_size(egui::vec2(160.0, 120.0)));
-                }
-                ui.label(RichText::new(msg).color(theme::muted()));
-            });
-            return;
-        }
-
-        for idx in 0..self.mod_results.len() {
-            let hit = self.mod_results[idx].clone();
-            let kind = project::ProjectKind::Content(self.content_kind);
-            let opened = catalog_card(ui, &hit.project_id, false, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    self.project_icon(ui, &hit.title, hit.icon_url.as_deref(), 52.0);
-                    ui.vertical(|ui| {
-                        ui.set_max_width((ui.available_width() - 200.0).max(200.0));
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(&hit.title).size(16.0).family(ui::bold_family()));
-                            ui.label(RichText::new(format!("от {}", hit.author)).color(theme::muted()).size(12.5));
-                        });
-                        ui.label(RichText::new(truncate(&hit.description, 140)).color(theme::muted()).size(13.0));
-                        let is_release = |v: &&String| v.chars().all(|c| c.is_ascii_digit() || c == '.');
-                        let latest: Vec<&str> = hit.versions.iter().filter(is_release).rev().take(4).map(|s| s.as_str()).collect();
-                        ui.label(
-                            RichText::new(format!("↓ {} · для {}", project::format_count(hit.downloads), latest.join(", ")))
-                                .color(theme::muted())
-                                .size(12.0),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui::button(ui, ui::BtnKind::Primary, Some(Icon::Download), "Установить", !busy).clicked() {
-                            self.quick_install(&hit);
-                        }
-                        if ui::secondary(ui, None, "Версии") {
-                            self.open_project(&hit, kind, project::TAB_VERSIONS);
-                        }
-                    });
-                });
-            });
-            if opened && self.page == Page::Mods {
-                self.open_project(&hit, kind, project::TAB_ABOUT);
-            }
-            ui.add_space(4.0);
-        }
-    }
-
     /// One-click install: newest version compatible with the target instance.
     fn quick_install(&mut self, hit: &modrinth::SearchHit) {
         let Some(target) = self.state.instances.get(self.active_index()).cloned() else {
@@ -3414,28 +3150,15 @@ impl LimeApp {
         self.mod_install_report = None;
     }
 
-    fn search_mods(&mut self) {
-        let query = self.mod_search_query.trim().to_string();
-        let kind = self.content_kind;
-        let target = self.state.instances.get(self.active_index()).cloned();
-        let client = install::make_client();
-        let only = self.only_compatible;
-        self.mod_search_job = Some(start_detached(&client, move |c| {
-            let (game, loaders) = match (&target, only) {
-                (Some(t), true) => (
-                    Some(t.game_version.clone()),
-                    if kind.uses_loader() { mods::mod_loaders(t) } else { Vec::new() },
-                ),
-                _ => (None, Vec::new()),
-            };
-            modrinth::search_filtered(c, &query, kind.project_type(), game.as_deref(), &loaders, 20, 0)
-        }));
-    }
-
     // ---- «Установленные»: список, включить/выключить, удалить, обновить ----
 
     fn load_installed(&mut self, inst: &Instance) {
         let kind = self.content_kind;
+        // a list of another instance or content type must not show while the new one loads
+        let dir = mods::content_dir(&self.root, &inst.name, kind);
+        if self.installed_items.first().is_some_and(|i| i.path.parent() != Some(dir.as_path())) {
+            self.installed_items.clear();
+        }
         self.installed_for = Some((inst.name.clone(), kind));
         self.updates.clear();
         let root = self.root.clone();
@@ -4326,6 +4049,7 @@ impl LimeApp {
     }
 }
 
+mod catalog;
 mod project;
 #[cfg(test)]
 mod snapshot;

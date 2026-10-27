@@ -89,6 +89,9 @@ icons! {
     CaretLeft = '\u{E138}', false;
     CaretRight = '\u{E13A}', false;
     External = '\u{E5DE}', false;
+    Star = '\u{E46A}', false;
+    StarFill = '\u{E46A}', true;
+    Funnel = '\u{E266}', false;
 }
 
 /// Draw `icon` centered in `rect`. The glyph is centered by its visible
@@ -702,6 +705,32 @@ pub fn chip(ui: &mut Ui, text: &str, color: Color32) -> Response {
     }
     ui.painter().galley(rect.center() - galley.size() / 2.0, galley, color);
     resp
+}
+
+/// A chip that is switched on and off by a click (catalog filters); `icon` goes after the text.
+pub fn toggle_chip(ui: &mut Ui, text: &str, on: bool, icon: Option<Icon>) -> Response {
+    let font = FontId::new(13.0, if theme::pixel() { bold_family() } else { egui::FontFamily::Proportional });
+    let fg = if on { theme::accent_fg() } else { theme::text() };
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, fg);
+    let icon_w = if icon.is_some() { 18.0 } else { 0.0 };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 22.0 + icon_w, 28.0), Sense::click());
+    let hov = anim(ui.ctx(), resp.id.with("hover"), resp.hovered(), 0.12);
+    let fill = if on { theme::mix(theme::green(), Color32::WHITE, 0.12 * hov) } else { theme::mix(theme::button(), theme::hover_bg(), hov) };
+    if theme::pixel() {
+        paint_notched(ui.painter(), rect, 3.0, fill);
+    } else {
+        ui.painter().rect_filled(rect, CornerRadius::same(9), fill);
+        if !on {
+            ui.painter().rect_stroke(rect, CornerRadius::same(9), Stroke::new(1.0, theme::divider()), StrokeKind::Inside);
+        }
+    }
+    let x = rect.left() + 11.0;
+    ui.painter().galley(Pos2::new(x, rect.center().y - galley.size().y / 2.0), galley.clone(), fg);
+    if let Some(ic) = icon {
+        let at = Pos2::new(x + galley.size().x + 4.0 + 7.0, rect.center().y);
+        paint_icon(ui, ic, Rect::from_center_size(at, Vec2::splat(12.0)), fg);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Card heading with an icon.

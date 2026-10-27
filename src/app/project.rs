@@ -203,6 +203,13 @@ impl LimeApp {
     /// Open the card of a catalog project (`tab` = which tab to show first).
     pub(super) fn open_project(&mut self, hit: &modrinth::SearchHit, kind: ProjectKind, tab: usize) {
         let now = self.ctx.input(|i| i.time);
+        // the card of a resource pack works with resource packs of the target instance, etc.
+        if let ProjectKind::Content(k) = kind {
+            if k != self.content_kind {
+                self.content_kind = k;
+                self.reset_mod_search();
+            }
+        }
         let mut view = ProjectView {
             hit: hit.clone(),
             kind,
@@ -260,7 +267,11 @@ impl LimeApp {
         if let Some(res) = view.versions_job.as_ref().and_then(drain) {
             view.versions_job = None;
             match res {
-                Ok(list) => view.versions = list,
+                Ok(mut list) => {
+                    // newest first, whatever order the server answered in
+                    list.sort_by(|a, b| b.date_published.cmp(&a.date_published));
+                    view.versions = list;
+                }
                 Err(e) => view.versions_error = Some(e),
             }
         }
@@ -324,6 +335,7 @@ impl LimeApp {
                     self.toast = Some("Сначала создайте сборку на вкладке «Библиотека»".to_string());
                     return;
                 };
+                let installed = self.installed_item(view.kind, &view.hit.project_id);
                 let version = match version {
                     Some(v) => v,
                     None if view.versions_job.is_none() && view.versions_error.is_none() => {
@@ -350,7 +362,15 @@ impl LimeApp {
                 let root = self.root.clone();
                 let prog = Arc::new(install::InstallProgress::new());
                 let prog_ref = prog.clone();
-                self.mod_install_job = Some(start_detached(&client, move |c| mods::install(c, &root, &target, kind, &version, Some(&prog_ref))));
+                self.mod_install_job = Some(start_detached(&client, move |c| match installed {
+                    // another version of an installed project replaces it (never two copies side by side)
+                    Some(item) => {
+                        let path = mods::apply_update(c, &root, &target, kind, &item, &version, Some(&prog_ref))?;
+                        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        Ok(mods::InstallReport { installed: vec![name], warnings: Vec::new() })
+                    }
+                    None => mods::install(c, &root, &target, kind, &version, Some(&prog_ref)),
+                }));
                 self.mod_install_prog = Some(prog);
                 self.mod_install_report = None;
             }
@@ -361,11 +381,25 @@ impl LimeApp {
 // ---------------------------------------------------------------- the page
 
 impl LimeApp {
+    /// The installed file of a project in the target instance, once the list of
+    /// that instance (and content type) has been read.
+    pub(super) fn installed_item(&self, kind: ProjectKind, project_id: &str) -> Option<mods::InstalledItem> {
+        let ProjectKind::Content(k) = kind else { return None };
+        let inst = self.state.instances.get(self.active_index())?;
+        if self.installed_for.as_ref() != Some(&(inst.name.clone(), k)) {
+            return None;
+        }
+        self.installed_items.iter().find(|i| i.project_id.as_deref() == Some(project_id)).cloned()
+    }
+
     pub(super) fn draw_project_page(&mut self, ui: &mut egui::Ui) {
         let Some(mut view) = self.project_view.take() else {
             self.page = Page::Mods;
             return;
         };
+        if matches!(view.kind, ProjectKind::Content(_)) {
+            self.ensure_installed_list();
+        }
         ui.add_space(12.0);
         self.draw_project_header(ui, &mut view);
         ui.add_space(10.0);
@@ -400,6 +434,12 @@ impl LimeApp {
         let hit = view.hit.clone();
         let p = view.project.clone();
         let busy = self.mod_install_job.is_some() || self.pack_install_job.is_some();
+        let installed = match view.kind {
+            ProjectKind::Content(_) => self.installed_item(view.kind, &hit.project_id).is_some(),
+            ProjectKind::Modpack => self.pack_installed(&hit),
+        };
+        let fav = self.is_favorite(&hit.project_id);
+        let mut category_click: Option<String> = None;
         ui::card().inner_margin(egui::Margin::same(16)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -415,6 +455,10 @@ impl LimeApp {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(ui::bold(&hit.title, 24.0).color(theme::text()));
                         ui::chip(ui, view.kind.label(), theme::green_dark());
+                        if installed {
+                            let mark = if view.kind == ProjectKind::Modpack { "установлен" } else { "установлено" };
+                            ui::chip(ui, mark, theme::green_dark());
+                        }
                     });
                     ui.label(RichText::new(format!("от {}", hit.author)).color(theme::muted()).size(13.0));
                     ui.add_space(2.0);
@@ -447,19 +491,32 @@ impl LimeApp {
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
                             for c in cats.iter().take(14) {
-                                ui::chip(ui, &c.replace('-', " "), theme::muted());
+                                // a click shows the catalog filtered by this category
+                                let r = ui::toggle_chip(ui, &super::catalog::category_label(c), false, None).on_hover_text("Показать похожие в каталоге");
+                                ui::reg(&format!("card-category:{c}"), r.rect);
+                                if r.clicked() {
+                                    category_click = Some(c.clone());
+                                }
                             }
                         });
                     }
                 });
                 ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
-                    if ui::button(ui, ui::BtnKind::Primary, Some(Icon::Download), "Установить", !busy).clicked() {
+                    // a modpack can be installed once more (as another instance); content cannot
+                    if installed && view.kind != ProjectKind::Modpack {
+                        ui::button(ui, ui::BtnKind::Secondary, Some(Icon::Check), "Установлено", false);
+                    } else if ui::button(ui, ui::BtnKind::Primary, Some(Icon::Download), "Установить", !busy).clicked() {
                         self.install_from_card(view, None);
                     }
                     ui.add_space(6.0);
-                    if ui::secondary(ui, Some(Icon::External), "Modrinth") {
-                        ui.ctx().open_url(egui::OpenUrl::new_tab(modrinth_url(&hit)));
-                    }
+                    ui.horizontal(|ui| {
+                        if ui::secondary(ui, Some(Icon::External), "Modrinth") {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(modrinth_url(&hit)));
+                        }
+                        if super::catalog::favorite_button(ui, fav) {
+                            self.toggle_favorite(&hit);
+                        }
+                    });
                 });
             });
 
@@ -500,6 +557,10 @@ impl LimeApp {
             }
         });
 
+        if let Some(c) = category_click {
+            self.filter_by_category(view.kind, &c);
+            return;
+        }
         let prog = self.mod_install_prog.clone().or_else(|| self.pack_install_prog.clone());
         if let Some(prog) = prog {
             ui.add_space(8.0);
@@ -744,6 +805,7 @@ impl LimeApp {
         }
         let total = list.len();
         let busy = self.mod_install_job.is_some() || self.pack_install_job.is_some();
+        let installed_version = self.installed_item(view.kind, &view.hit.project_id).and_then(|i| i.version_number);
         let mut install: Option<modrinth::Version> = None;
         ui::card().inner_margin(egui::Margin::same(6)).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -754,7 +816,8 @@ impl LimeApp {
                     ui.painter().hline((r.left() + 8.0)..=(r.right() - 8.0), y, Stroke::new(1.0, theme::divider()));
                 }
                 let fits = version_fits(v, view.kind, target.as_ref());
-                if version_row(ui, v, fits, show_loaders, busy) {
+                let here = installed_version.as_deref() == Some(v.version_number.as_str());
+                if version_row(ui, v, fits, here, show_loaders, busy) {
                     install = Some((*v).clone());
                 }
             }
@@ -980,7 +1043,8 @@ impl LimeApp {
 }
 
 /// One row of the versions list. Returns true when its install key was pressed.
-fn version_row(ui: &mut egui::Ui, v: &modrinth::Version, fits: bool, show_loaders: bool, busy: bool) -> bool {
+/// `installed`: this very version is in the target instance.
+fn version_row(ui: &mut egui::Ui, v: &modrinth::Version, fits: bool, installed: bool, show_loaders: bool, busy: bool) -> bool {
     let mut clicked = false;
     let fill = if fits { theme::mix(theme::card(), theme::green(), 0.10) } else { egui::Color32::TRANSPARENT };
     let out = egui::Frame::new()
@@ -996,7 +1060,9 @@ fn version_row(ui: &mut egui::Ui, v: &modrinth::Version, fits: bool, show_loader
                         ui.spacing_mut().item_spacing.x = 6.0;
                         ui.label(ui::bold(truncate(&v.version_number, 40), 15.0).color(theme::text()));
                         ui::chip(ui, type_label(&v.version_type), type_color(&v.version_type));
-                        if fits {
+                        if installed {
+                            ui::chip(ui, "установлена", theme::green_dark());
+                        } else if fits {
                             ui::chip(ui, "подходит", theme::green_dark());
                         }
                         if !v.name.is_empty() && v.name != v.version_number {
@@ -1019,7 +1085,9 @@ fn version_row(ui: &mut egui::Ui, v: &modrinth::Version, fits: bool, show_loader
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let kind = if fits { ui::BtnKind::Primary } else { ui::BtnKind::Secondary };
-                    let resp = if busy {
+                    let resp = if installed {
+                        ui::button(ui, ui::BtnKind::Secondary, Some(Icon::Check), "", false).on_hover_text("Эта версия уже установлена")
+                    } else if busy {
                         ui::button(ui, ui::BtnKind::Secondary, Some(Icon::Download), "", false)
                     } else {
                         ui::icon_key(ui, Icon::Download, kind, "Установить эту версию")
