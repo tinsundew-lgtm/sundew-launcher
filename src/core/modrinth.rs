@@ -27,6 +27,8 @@ pub struct SearchHit {
     pub follows: u64,
     pub icon_url: Option<String>,
     pub versions: Vec<String>,
+    #[serde(default)]
+    pub categories: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -42,6 +44,8 @@ pub struct ProjectFile {
     pub primary: Option<bool>,
     #[serde(default)]
     pub hashes: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub size: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -66,6 +70,41 @@ pub struct Version {
     pub files: Vec<ProjectFile>,
     #[serde(default)]
     pub dependencies: Vec<Dependency>,
+    /// RFC 3339 time, e.g. `2024-05-01T12:00:00Z`.
+    #[serde(default)]
+    pub date_published: String,
+    #[serde(default)]
+    pub downloads: u64,
+}
+
+impl Version {
+    /// The file a version is installed from: the primary one, else the first.
+    pub fn primary_file(&self) -> Option<&ProjectFile> {
+        self.files.iter().find(|f| f.primary == Some(true)).or_else(|| self.files.first())
+    }
+}
+
+/// One picture of a project's gallery: `url` is a small preview, `raw_url` the original.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GalleryImage {
+    pub url: String,
+    #[serde(default)]
+    pub raw_url: Option<String>,
+    #[serde(default)]
+    pub featured: bool,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub ordering: i64,
+}
+
+impl GalleryImage {
+    /// Address of the full-size picture.
+    pub fn full_url(&self) -> &str {
+        self.raw_url.as_deref().filter(|u| !u.is_empty()).unwrap_or(&self.url)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -79,7 +118,33 @@ pub struct Project {
     pub project_type: String,
     pub icon_url: Option<String>,
     pub downloads: Option<u64>,
+    #[serde(alias = "followers")]
     pub follows: Option<u64>,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub additional_categories: Vec<String>,
+    #[serde(default)]
+    pub gallery: Vec<GalleryImage>,
+    #[serde(default)]
+    pub updated: Option<String>,
+    #[serde(default)]
+    pub source_url: Option<String>,
+    #[serde(default)]
+    pub issues_url: Option<String>,
+    #[serde(default)]
+    pub wiki_url: Option<String>,
+    #[serde(default)]
+    pub discord_url: Option<String>,
+}
+
+impl Project {
+    /// Gallery in the author's order (featured pictures first when the order ties).
+    pub fn gallery_sorted(&self) -> Vec<GalleryImage> {
+        let mut g = self.gallery.clone();
+        g.sort_by_key(|i| (i.ordering, !i.featured));
+        g
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -277,18 +342,19 @@ pub fn download_mrpack(client: &reqwest::blocking::Client, url: &str, dest: &Pat
 /// take the newest version that ships a `.mrpack` file.
 pub fn latest_mrpack_url(client: &reqwest::blocking::Client, project_id: &str) -> Result<MrpackFile, String> {
     let versions = get_project_versions(client, project_id)?;
-    for v in versions {
-        for f in &v.files {
-            if f.filename.to_lowercase().ends_with(".mrpack") {
-                return Ok(MrpackFile {
-                    url: f.url.clone(),
-                    sha1: f.hashes.get("sha1").map(|h| h.to_lowercase()),
-                    sha512: f.hashes.get("sha512").map(|h| h.to_lowercase()),
-                });
-            }
-        }
+    if let Some(pack) = versions.iter().find_map(mrpack_of) {
+        return Ok(pack);
     }
     Err(format!("у проекта {project_id} не найдено .mrpack файлов"))
+}
+
+/// The `.mrpack` file of one modpack version.
+pub fn mrpack_of(version: &Version) -> Option<MrpackFile> {
+    version.files.iter().find(|f| f.filename.to_lowercase().ends_with(".mrpack")).map(|f| MrpackFile {
+        url: f.url.clone(),
+        sha1: f.hashes.get("sha1").map(|h| h.to_lowercase()),
+        sha512: f.hashes.get("sha512").map(|h| h.to_lowercase()),
+    })
 }
 
 /// A modpack archive and the hashes Modrinth publishes for it.
@@ -364,6 +430,32 @@ mod tests {
         assert_eq!(idx.version_id.as_deref(), Some("1.0"));
         assert!(!idx.files[0].client_supported());
         assert_eq!(idx.files[0].file_size, Some(10));
+    }
+
+    #[test]
+    fn project_details_and_versions_parse() {
+        let p: Project = serde_json::from_str(
+            r##"{"id":"P","slug":"p","title":"T","description":"d","body":"Hi","project_type":"shader",
+            "icon_url":null,"downloads":5,"followers":7,"categories":["a"],"additional_categories":["b"],
+            "gallery":[{"url":"https://x/2_350.webp","raw_url":"https://x/2.png","featured":false,"title":"Two","description":null,"created":"","ordering":1},
+                       {"url":"https://x/1_350.webp","raw_url":null,"featured":true,"title":null,"description":null,"created":"","ordering":0}]}"##,
+        )
+        .unwrap();
+        assert_eq!(p.follows, Some(7));
+        let g = p.gallery_sorted();
+        assert_eq!(g[0].full_url(), "https://x/1_350.webp", "no raw picture: the preview is used");
+        assert_eq!(g[1].full_url(), "https://x/2.png");
+
+        let v: Version = serde_json::from_str(
+            r#"{"id":"v","project_id":"P","name":"n","version_number":"1.0","version_type":"beta",
+            "date_published":"2024-05-01T10:00:00Z","downloads":3,
+            "files":[{"url":"https://cdn.modrinth.com/a.zip","filename":"a.zip","primary":false,"size":10},
+                     {"url":"https://cdn.modrinth.com/p.mrpack","filename":"P.mrpack","primary":true,"size":2048,"hashes":{"sha1":"AB"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(v.primary_file().unwrap().size, 2048);
+        let pack = mrpack_of(&v).unwrap();
+        assert_eq!((pack.url.as_str(), pack.sha1.as_deref()), ("https://cdn.modrinth.com/p.mrpack", Some("ab")));
     }
 
     #[test]

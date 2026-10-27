@@ -27,13 +27,15 @@ type Job<T> = Arc<Mutex<Option<Result<T, String>>>>;
 ///    чистых клиентов (Vanilla/Fabric/Forge/NeoForge) + создание новых.
 ///  - `Mods`     — «Моды»: каталог и управление модами (+ модпаки Modrinth).
 ///  - `Other`    — «Другое»: ресурспаки, шейдеры, глобальные настройки.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Page {
     Home,
     Mods,
     Skins,
     Other,
     Instance,
+    /// Card of one catalog project.
+    Project,
 }
 
 /// What a file dialog is for.
@@ -210,10 +212,8 @@ pub struct LimeApp {
     mod_search_query: String,
     mod_search_job: Option<Job<Vec<modrinth::SearchHit>>>,
     mod_results: Vec<modrinth::SearchHit>,
-    selected_mod: Option<usize>,
-    mod_versions_job: Option<Job<Vec<modrinth::Version>>>,
-    mod_versions: Vec<modrinth::Version>,
-    selected_mod_version: Option<usize>,
+    /// The open project card (page `Project`).
+    project_view: Option<project::ProjectView>,
     mod_install_prog: Option<Arc<install::InstallProgress>>,
     mod_searched: bool,
     mod_search_error: Option<String>,
@@ -403,10 +403,7 @@ impl LimeApp {
             mod_search_query: String::new(),
             mod_search_job: None,
             mod_results: Vec::new(),
-            selected_mod: None,
-            mod_versions_job: None,
-            mod_versions: Vec::new(),
-            selected_mod_version: None,
+            project_view: None,
             mod_install_prog: None,
             mod_install_job: None,
             mod_install_report: None,
@@ -504,8 +501,6 @@ impl LimeApp {
     /// Forget catalog results (target instance or content type changed).
     fn reset_mod_search(&mut self) {
         self.mod_results.clear();
-        self.selected_mod = None;
-        self.mod_versions.clear();
         self.mod_searched = false;
         self.mod_search_error = None;
         self.mod_install_report = None;
@@ -516,11 +511,11 @@ impl LimeApp {
             || self.pack_search_job.is_some()
             || self.pack_install_job.is_some()
             || self.mod_search_job.is_some()
-            || self.mod_versions_job.is_some()
+            || self.project_view.as_ref().is_some_and(|v| v.project_job.is_some() || v.versions_job.is_some())
             || self.mod_install_job.is_some()
             || self.installed_job.is_some()
             || self.net_job.is_some()
-            || !self.icon_jobs.is_empty()
+            || self.running_picture_jobs() > 0
             || self.skin_job.is_some()
             || self.updates_job.is_some()
             || self.update_job.is_some()
@@ -652,13 +647,16 @@ impl LimeApp {
                     ui.ctx().request_repaint();
                 }
                 ui.set_opacity(enter);
-                let out = egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                // every page (and every project card) keeps its own scroll position
+                let card_id = self.project_view.as_ref().filter(|_| self.page == Page::Project).map(|v| v.hit.project_id.clone());
+                let out = egui::ScrollArea::vertical().id_salt(("page", self.page, card_id)).auto_shrink([false, false]).show(ui, |ui| {
                     match self.page {
                         Page::Home => self.draw_home(ui),
                         Page::Mods => self.draw_mods(ui),
                         Page::Skins => self.draw_skins(ui),
                         Page::Other => self.draw_other(ui),
                         Page::Instance => self.draw_instance_page(ui),
+                        Page::Project => self.draw_project_page(ui),
                     }
                 });
                 if self.page == Page::Other {
@@ -666,6 +664,9 @@ impl LimeApp {
                 }
             });
 
+        if self.page == Page::Project {
+            self.draw_lightbox(ui.ctx());
+        }
         self.draw_toast(ui.ctx());
         self.draw_profile_menu(ui.ctx());
 
@@ -930,6 +931,10 @@ impl LimeApp {
                 if ui::secondary(ui, Some(Icon::Back), "Назад") {
                     self.page = Page::Home;
                 }
+            } else if self.page == Page::Project {
+                if ui::secondary(ui, Some(Icon::Back), "Назад") {
+                    self.page = Page::Mods;
+                }
             } else {
                 self.account_chip(ui, small_chip);
             }
@@ -937,7 +942,7 @@ impl LimeApp {
 
         let mut sel = match self.page {
             Page::Home | Page::Instance => 0,
-            Page::Mods => 1,
+            Page::Mods | Page::Project => 1,
             Page::Skins => 2,
             Page::Other => 3,
         };
@@ -946,7 +951,7 @@ impl LimeApp {
             if icon_only_tabs {
                 ui::icon_tabs(ui, &icon_tabs, &mut sel);
             } else {
-                ui::pill_tabs(ui, &tabs, &mut sel);
+                ui::main_tabs(ui, &tabs, &mut sel);
             }
         });
         if sel != before {
@@ -1071,7 +1076,6 @@ impl LimeApp {
                 match res {
                     Ok(list) => {
                         self.mod_results = list;
-                        self.selected_mod = None;
                         self.mod_searched = true;
                         self.mod_search_error = None;
                     }
@@ -1080,19 +1084,8 @@ impl LimeApp {
             }
         }
 
-        // mod versions
-        if let Some(job) = &self.mod_versions_job {
-            if let Some(res) = drain(job) {
-                self.mod_versions_job = None;
-                match res {
-                    Ok(list) => {
-                        self.mod_versions = list;
-                        self.selected_mod_version = None;
-                    }
-                    Err(e) => self.toast = Some(format!("Ошибка версий мода: {e}")),
-                }
-            }
-        }
+        // the open project card
+        self.poll_project();
 
         // mod install
         if let Some(job) = &self.mod_install_job {
@@ -1877,13 +1870,18 @@ impl LimeApp {
             }
             return None;
         }
-        if self.icon_jobs.len() < 6 {
+        if self.running_picture_jobs() < 6 {
             let (url_owned, cache) = (url.to_string(), self.root.join("cache").join("icons"));
             let client = install::make_client();
             let job = start_detached(&client, move |c| images::cached_icon(c, &url_owned, &cache, 96));
             self.icon_jobs.insert(url.to_string(), job);
         }
         None
+    }
+
+    /// Picture downloads still running (finished ones wait in `icon_jobs` until shown).
+    fn running_picture_jobs(&self) -> usize {
+        self.icon_jobs.values().filter(|j| j.lock().map(|r| r.is_none()).unwrap_or(false)).count()
     }
 
     /// Project icon, or a coloured tile with initials while loading / without icon.
@@ -2821,8 +2819,8 @@ impl LimeApp {
         }
         // front / back
         let tabs = [(None, "Спереди"), (None, "Сзади")];
-        let w = ui::pill_tabs_width(ui, &tabs);
-        let strip = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.bottom() - 32.0), egui::vec2(w, 40.0));
+        let w = ui::pill_tabs_framed_width(ui, &tabs);
+        let strip = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.bottom() - 36.0), egui::vec2(w, 50.0));
         let mut sel = if self.skin_view == skins::View::Front { 0 } else { 1 };
         ui.scope_builder(egui::UiBuilder::new().max_rect(strip).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
             ui::pill_tabs(ui, &tabs, &mut sel);
@@ -3040,9 +3038,7 @@ impl LimeApp {
         for idx in 0..self.pack_results.len() {
             let hit = self.pack_results[idx].clone();
             let selected = self.selected_pack == Some(idx);
-            ui::card()
-                .stroke(Stroke::new(1.0, if selected { theme::green() } else { theme::divider() }))
-                .show(ui, |ui| {
+            let opened = catalog_card(ui, &hit.project_id, selected, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         self.project_icon(ui, &hit.title, hit.icon_url.as_deref(), 52.0);
@@ -3054,7 +3050,7 @@ impl LimeApp {
                             });
                             ui.label(RichText::new(truncate(&hit.description, 140)).color(theme::muted()).size(13.0));
                             ui.label(
-                                RichText::new(format!("↓ {} · версий игры: {}", hit.downloads, hit.versions.len()))
+                                RichText::new(format!("↓ {} · версий игры: {}", project::format_count(hit.downloads), hit.versions.len()))
                                     .color(theme::muted())
                                     .size(12.0),
                             );
@@ -3064,9 +3060,15 @@ impl LimeApp {
                             if ui::button(ui, ui::BtnKind::Primary, Some(Icon::Download), "Установить", !busy).clicked() {
                                 self.selected_pack = Some(idx);
                             }
+                            if ui::secondary(ui, None, "Версии") {
+                                self.open_project(&hit, project::ProjectKind::Modpack, project::TAB_VERSIONS);
+                            }
                         });
                     });
                 });
+            if opened && self.page == Page::Mods {
+                self.open_project(&hit, project::ProjectKind::Modpack, project::TAB_ABOUT);
+            }
             ui.add_space(4.0);
         }
     }
@@ -3087,6 +3089,12 @@ impl LimeApp {
         } else {
             name
         };
+        self.start_pack_install_named(hit, name, None);
+    }
+
+    /// Install a modpack as a new instance called `name`: the given `.mrpack`
+    /// (one chosen version) or the newest one.
+    fn start_pack_install_named(&mut self, hit: &modrinth::SearchHit, name: String, pack: Option<modrinth::MrpackFile>) {
         let slug = hit.slug.clone().unwrap_or_else(|| hit.project_id.clone());
         let instance = Instance {
             name: name.clone(),
@@ -3112,7 +3120,10 @@ impl LimeApp {
         let job = start_detached(&client, move |c| {
             // resolve the real .mrpack URL through the API (the CDN
             // `latest.mrpack` alias answers 400), then install it.
-            let pack = modrinth::latest_mrpack_url(c, &project_id)?;
+            let pack = match pack {
+                Some(p) => p,
+                None => modrinth::latest_mrpack_url(c, &project_id)?,
+            };
             let mut inst = install::install_mrpack(c, &root, &instance, &pack, Some(&prog_ref))?;
             // the modpack's icon becomes the instance's icon (best effort)
             if let Some(url) = icon_url {
@@ -3131,6 +3142,25 @@ impl LimeApp {
 }
 
 // ------------------------------------------------------------------ Mods
+
+/// A catalog card that opens the project when clicked anywhere outside its
+/// buttons (they sit above the card and keep their own clicks). Returns true on click.
+fn catalog_card(ui: &mut egui::Ui, project_id: &str, selected: bool, add: impl FnOnce(&mut egui::Ui)) -> bool {
+    let id = egui::Id::new(("catalog-card", project_id));
+    let was_hovered = ui.ctx().data(|d| d.get_temp::<bool>(id).unwrap_or(false));
+    let hov = ui::anim(ui.ctx(), id.with("anim"), was_hovered, 0.15);
+    let color = if selected { theme::green() } else { theme::mix(theme::divider(), theme::green(), hov * 0.85) };
+    let out = ui.scope_builder(egui::UiBuilder::new().id_salt(id).sense(egui::Sense::click()), |ui| {
+        ui::card().stroke(Stroke::new(1.0, color)).show(ui, add);
+    });
+    let resp = out.response;
+    ui::reg(&format!("card:{project_id}"), resp.rect);
+    ui.ctx().data_mut(|d| d.insert_temp(id, resp.contains_pointer()));
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.clicked()
+}
 
 fn format_size(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
@@ -3277,9 +3307,8 @@ impl LimeApp {
 
         for idx in 0..self.mod_results.len() {
             let hit = self.mod_results[idx].clone();
-            let selected = self.selected_mod == Some(idx);
-            let frame = ui::card().stroke(Stroke::new(1.0, if selected { theme::green() } else { theme::divider() }));
-            frame.show(ui, |ui| {
+            let kind = project::ProjectKind::Content(self.content_kind);
+            let opened = catalog_card(ui, &hit.project_id, false, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     self.project_icon(ui, &hit.title, hit.icon_url.as_deref(), 52.0);
@@ -3293,7 +3322,7 @@ impl LimeApp {
                         let is_release = |v: &&String| v.chars().all(|c| c.is_ascii_digit() || c == '.');
                         let latest: Vec<&str> = hit.versions.iter().filter(is_release).rev().take(4).map(|s| s.as_str()).collect();
                         ui.label(
-                            RichText::new(format!("↓ {} · для {}", hit.downloads, latest.join(", ")))
+                            RichText::new(format!("↓ {} · для {}", project::format_count(hit.downloads), latest.join(", ")))
                                 .color(theme::muted())
                                 .size(12.0),
                         );
@@ -3303,53 +3332,15 @@ impl LimeApp {
                             self.quick_install(&hit);
                         }
                         if ui::secondary(ui, None, "Версии") {
-                            self.selected_mod = Some(idx);
-                            self.load_mod_versions(&hit);
+                            self.open_project(&hit, kind, project::TAB_VERSIONS);
                         }
                     });
                 });
             });
+            if opened && self.page == Page::Mods {
+                self.open_project(&hit, kind, project::TAB_ABOUT);
+            }
             ui.add_space(4.0);
-        }
-
-        // version picker for the project chosen with «Версии»
-        if let Some(hit) = self.selected_mod.and_then(|i| self.mod_results.get(i).cloned()) {
-            ui.add_space(8.0);
-            ui::card().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Версии «{}»", hit.title)).size(16.0).family(ui::bold_family()));
-                    if self.mod_versions_job.is_some() {
-                        ui.add(egui::Spinner::new());
-                    }
-                });
-                if !self.mod_versions.is_empty() {
-                    let mut sel = self.selected_mod_version.unwrap_or(0).min(self.mod_versions.len() - 1);
-                    ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("modVersion")
-                            .width(520.0)
-                            .selected_text(self.mod_versions.get(sel).map(version_label).unwrap_or_default())
-                            .show_ui(ui, |ui| {
-                                for (vidx, v) in self.mod_versions.iter().enumerate() {
-                                    if ui.selectable_label(vidx == sel, version_label(v)).clicked() {
-                                        sel = vidx;
-                                    }
-                                }
-                            });
-                        if ui::button(ui, ui::BtnKind::Primary, Some(Icon::Download), "Установить выбранную", !busy).clicked() {
-                            self.selected_mod_version = Some(sel);
-                            self.start_mod_install();
-                        }
-                    });
-                    self.selected_mod_version = Some(sel);
-                } else if self.mod_versions_job.is_none() {
-                    ui.label(
-                        RichText::new("Нет версий, подходящих этой сборке. Снимите «Только совместимые» или выберите другую сборку.")
-                            .color(theme::muted())
-                            .size(13.0),
-                    );
-                }
-            });
         }
     }
 
@@ -3397,49 +3388,6 @@ impl LimeApp {
             };
             modrinth::search_filtered(c, &query, kind.project_type(), game.as_deref(), &loaders, 20, 0)
         }));
-    }
-
-    fn load_mod_versions(&mut self, hit: &modrinth::SearchHit) {
-        let Some(target) = self.state.instances.get(self.active_index()).cloned() else {
-            self.mod_versions.clear();
-            self.selected_mod_version = None;
-            return;
-        };
-        let id = hit.project_id.clone();
-        let kind = self.content_kind;
-        let only = self.only_compatible;
-        let client = install::make_client();
-        self.mod_versions_job = Some(start_detached(&client, move |c| {
-            if !only || target.game_version.is_empty() || target.game_version == "latest" {
-                return modrinth::get_project_versions(c, &id);
-            }
-            let loaders = if kind.uses_loader() { mods::mod_loaders(&target) } else { Vec::new() };
-            modrinth::get_versions_for(c, &id, &target.game_version, &loaders)
-        }));
-        self.mod_versions.clear();
-        self.selected_mod_version = None;
-        self.mod_install_report = None;
-    }
-
-    fn start_mod_install(&mut self) {
-        let Some(version) = self.selected_mod_version.and_then(|i| self.mod_versions.get(i).cloned()) else {
-            self.toast = Some("Сначала выберите версию".to_string());
-            return;
-        };
-        let Some(target) = self.state.instances.get(self.active_index()).cloned() else {
-            self.toast = Some("Нет сборки для установки".to_string());
-            return;
-        };
-        let kind = self.content_kind;
-        let client = install::make_client();
-        let root = self.root.clone();
-        let prog = Arc::new(install::InstallProgress::new());
-        let prog_ref = prog.clone();
-        self.mod_install_job = Some(start_detached(&client, move |c| {
-            mods::install(c, &root, &target, kind, &version, Some(&prog_ref))
-        }));
-        self.mod_install_prog = Some(prog);
-        self.mod_install_report = None;
     }
 
     // ---- «Установленные»: список, включить/выключить, удалить, обновить ----
@@ -3620,12 +3568,6 @@ impl LimeApp {
             ui.add_space(4.0);
         }
     }
-}
-
-fn version_label(v: &modrinth::Version) -> String {
-    let games: Vec<&str> = v.game_versions.iter().rev().take(3).map(|s| s.as_str()).collect();
-    let loaders = if v.loaders.is_empty() { "any".to_string() } else { v.loaders.join("/") };
-    format!("{} · {} · {} · {}", v.version_number, v.version_type, games.join(","), loaders)
 }
 
 // ------------------------------------------------------------------ Settings
@@ -4342,5 +4284,8 @@ impl LimeApp {
     }
 }
 
+mod project;
+#[cfg(test)]
+mod snapshot;
 #[cfg(test)]
 mod tests;

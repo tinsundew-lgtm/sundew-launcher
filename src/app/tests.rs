@@ -58,6 +58,8 @@ struct H {
     mock: Mock,
     t: f64,
     size: egui::Vec2,
+    /// Textures uploaded so far (for snapshots).
+    canvas: super::snapshot::Canvas,
 }
 
 impl H {
@@ -84,13 +86,26 @@ impl H {
         let ctx = egui::Context::default();
         theme::apply(&ctx, true, crate::core::prefs::DEFAULT_ACCENT, 1.0, false, true);
         let app = LimeApp::with_root(&ctx, root.clone(), None);
-        let mut h = H { ctx, app, root, mock, t: 0.0, size: egui::vec2(1280.0, 800.0) };
+        let mut h = H { ctx, app, root, mock, t: 0.0, size: egui::vec2(1280.0, 800.0), canvas: Default::default() };
         h.frame(vec![]);
         h.frame(vec![]);
         h
     }
 
     fn frame(&mut self, events: Vec<Event>) {
+        let _ = self.frame_out(events);
+    }
+
+    /// Paint the next frame into `<LIMECRAFT_SNAPSHOT_DIR>/<name>.png` (no-op without the variable).
+    fn snapshot(&mut self, name: &str) {
+        let out = self.frame_out(vec![]);
+        if let Ok(dir) = std::env::var("LIMECRAFT_SNAPSHOT_DIR") {
+            let path = std::path::Path::new(&dir).join(format!("{name}.png"));
+            self.canvas.save(&self.ctx, out, self.size, &path);
+        }
+    }
+
+    fn frame_out(&mut self, events: Vec<Event>) -> egui::FullOutput {
         ui::REGISTRY.lock().unwrap().clear();
         let raw = RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.size)),
@@ -100,7 +115,9 @@ impl H {
         };
         self.t += 0.05;
         let app = &mut self.app;
-        let _ = self.ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        let mut out = self.ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        self.canvas.apply(&mut out.textures_delta);
+        out
     }
 
     fn rects(&self, label: &str) -> Vec<Rect> {
@@ -175,6 +192,11 @@ impl Drop for H {
 /// Percent-decoded request line (the launcher encodes `_` and `.` too).
 fn decoded(s: &str) -> String {
     percent_encoding::percent_decode_str(s).decode_utf8_lossy().to_string()
+}
+
+/// Finish a headless pass: there is no GPU, so texture uploads are dropped on purpose.
+fn done(mut out: egui::FullOutput) {
+    out.textures_delta.clear();
 }
 
 fn lock() -> std::sync::MutexGuard<'static, ()> {
@@ -523,9 +545,9 @@ fn every_icon_has_a_glyph_in_the_bundled_font() {
     let ctx = egui::Context::default();
     setup_fonts(&ctx, prefs::FontChoice::Builtin);
     let raw = || RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(300.0, 300.0))), ..Default::default() };
-    let _ = ctx.run_ui(raw(), |_| {}); // fonts take effect on the next pass
+    done(ctx.run_ui(raw(), |_| {})); // fonts take effect on the next pass
     let mut missing = Vec::new();
-    let _ = ctx.run_ui(raw(), |ui| {
+    done(ctx.run_ui(raw(), |ui| {
         for &icon in ui::ALL_ICONS {
             let (ch, fill) = icon.glyph();
             let family = egui::FontFamily::Name(if fill { ui::ICON_FONT_FILL } else { ui::ICON_FONT }.into());
@@ -535,7 +557,7 @@ fn every_icon_has_a_glyph_in_the_bundled_font() {
                 missing.push(format!("{icon:?}"));
             }
         }
-    });
+    }));
     assert!(missing.is_empty(), "icons without a glyph: {missing:?}");
 }
 
@@ -991,10 +1013,10 @@ fn hover_and_selection_fade_instead_of_jumping() {
     let mut seen = Vec::new();
     for k in 0..8 {
         let raw = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(100.0, 100.0))), time: Some(50.0 + k as f64 * 0.05), ..Default::default() };
-        let _ = h.ctx.run_ui(raw, |_| {
+        done(h.ctx.run_ui(raw, |_| {
             // (the first look at a state has nothing to fade from: start from "off")
             seen.push(ui::anim(&h.ctx, id, k > 0, 0.2));
-        });
+        }));
     }
     assert!(seen[0] < 0.1, "starts at the beginning: {seen:?}");
     assert!(seen.windows(2).all(|w| w[1] >= w[0]), "only grows: {seen:?}");
@@ -1010,7 +1032,7 @@ fn a_gliding_number_eases_out_and_can_change_course() {
     let mut at = |time: f64, target: f32| {
         let raw = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(100.0, 100.0))), time: Some(time), ..Default::default() };
         let mut v = 0.0;
-        let _ = h.ctx.run_ui(raw, |_| v = ui::tween(&h.ctx, id, target, 0.4));
+        done(h.ctx.run_ui(raw, |_| v = ui::tween(&h.ctx, id, target, 0.4)));
         v
     };
     assert_eq!(at(100.0, 10.0), 10.0, "the first value is taken as it is");
@@ -1030,4 +1052,201 @@ fn a_gliding_number_eases_out_and_can_change_course() {
     assert!(mid > 100.0, "{mid}");
     let next = at(101.05, 0.0);
     assert!(next < mid && next > 50.0, "turns around smoothly: {mid} -> {next}");
+}
+
+// ------------------------------------------------------------------ project card
+
+fn png_bytes(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(w, h, image::Rgba([rgb[0], rgb[1], rgb[2], 255])))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    png
+}
+
+fn project_json(id: &str, kind: &str, base: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","slug":"{id}","title":"Card {id}","description":"Short text","project_type":"{kind}",
+        "body":"Hello **world** and [a link](https://example.com).\n\n- point one\n- point two","icon_url":null,"downloads":12345,"followers":67,
+        "categories":["optimization"],"additional_categories":[],"updated":"2026-09-15T06:35:41Z",
+        "gallery":[{{"url":"{base}/img/a_350.png","raw_url":"{base}/img/a.png","featured":true,"title":"First","description":"One","ordering":0}},
+                   {{"url":"{base}/img/b_350.png","raw_url":"{base}/img/b.png","featured":false,"title":null,"description":null,"ordering":1}}]}}"#
+    )
+}
+
+fn card_version(id: &str, number: &str, games: &str, loaders: &str, file_url: &str, filename: &str, bytes: &[u8]) -> String {
+    format!(
+        r#"{{"id":"{id}","project_id":"AAA","name":"{number}","version_number":"{number}","version_type":"release","game_versions":[{games}],"loaders":[{loaders}],"date_published":"2026-01-02T00:00:00Z","downloads":10,"files":[{{"url":"{file_url}","filename":"{filename}","primary":true,"size":2048,"hashes":{{"sha1":"{}"}}}}],"dependencies":[]}}"#,
+        sha1_hex(bytes)
+    )
+}
+
+#[test]
+fn a_catalog_card_opens_the_project_with_description_versions_and_gallery() {
+    let _g = lock();
+    let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
+    let base = h.mock.url();
+    let jar = b"fitting-jar".to_vec();
+    let fit = card_version("v1", "2.0", r#""26.3""#, r#""fabric""#, &format!("{base}/files/fit.jar"), "fit.jar", &jar);
+    let old = card_version("v2", "1.0", r#""1.20.1""#, r#""forge""#, &format!("{base}/files/old.jar"), "old.jar", b"old");
+    h.mock.set(vec![
+        route("/search", 200, search_json(&[("AAA", "Sodium")])),
+        route("/project/AAA/version", 200, format!("[{fit},{old}]")),
+        route("/project/AAA", 200, project_json("AAA", "mod", &base)),
+        route("/img/a_350.png", 200, png_bytes(320, 180, [200, 40, 40])),
+        route("/img/b_350.png", 200, png_bytes(320, 180, [40, 200, 40])),
+        route("/img/a.png", 200, png_bytes(1280, 720, [200, 40, 40])),
+        route("/img/b.png", 200, png_bytes(1280, 720, [40, 200, 40])),
+        route("/version_files", 200, "{}"),
+        route("/files/fit.jar", 200, jar.clone()),
+    ]);
+    h.click("Каталог");
+    h.wait("search", 10, |a| a.mod_searched);
+
+    // a click on the card itself (not on its buttons) opens the project
+    h.click("card:AAA");
+    assert_eq!(h.app.page, Page::Project, "screen: {:?}", h.labels());
+    h.wait("project and versions loaded", 10, |a| {
+        a.project_view.as_ref().is_some_and(|v| v.project.is_some() && v.versions_job.is_none())
+    });
+    let view = h.app.project_view.as_ref().unwrap();
+    assert_eq!(view.versions.len(), 2);
+    assert!(view.body.iter().any(|b| matches!(b, crate::markdown::Block::Item(..))), "the description is read as markdown");
+    assert!(h.has("Установить") && h.has("Modrinth"), "header buttons; screen: {:?}", h.labels());
+
+    // versions: both are listed, the filter keeps only the one that fits the instance
+    h.click("Версии");
+    assert_eq!(h.rects("Установить эту версию").len(), 2, "screen: {:?}", h.labels());
+    h.click("versions:only-fitting");
+    assert_eq!(h.rects("Установить эту версию").len(), 1);
+    // installing that exact version puts its file into the instance
+    h.click("Установить эту версию");
+    h.wait("installed", 20, |a| a.mod_install_job.is_none() && a.mod_install_report.is_some());
+    let installed = instance::instance_mines(&h.root, "26.3 fabric").join("mods/fit.jar");
+    assert_eq!(std::fs::read(&installed).expect("the chosen version is installed"), jar);
+
+    // gallery: previews load in the background, a click opens the large view with arrows
+    h.click("Галерея");
+    h.wait("previews loaded", 10, |a| {
+        a.pics.keys().filter(|k| k.contains("/img/") && k.contains("_350")).count() == 2 && a.pics.values().all(|t| t.is_some())
+    });
+    h.click("gallery:0");
+    assert_eq!(h.app.project_view.as_ref().unwrap().lightbox, Some(0));
+    assert!(h.has("lightbox") && h.has("Следующее"), "screen: {:?}", h.labels());
+    h.wait("the large picture", 10, |a| a.pics.keys().any(|k| k.ends_with("/img/a.png")));
+    h.press(Key::ArrowRight);
+    assert_eq!(h.app.project_view.as_ref().unwrap().lightbox, Some(1));
+    h.click("Следующее");
+    assert_eq!(h.app.project_view.as_ref().unwrap().lightbox, Some(0), "the arrows go round");
+    h.click("Закрыть просмотр");
+    assert_eq!(h.app.project_view.as_ref().unwrap().lightbox, None);
+
+    h.click("Назад в каталог");
+    assert_eq!(h.app.page, Page::Mods);
+    assert_eq!(h.app.mod_results.len(), 1, "the catalog keeps its results");
+}
+
+#[test]
+fn every_kind_of_project_has_a_card() {
+    let _g = lock();
+    let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
+    let base = h.mock.url();
+    let pack = card_version("p1", "5.0", r#""26.3""#, r#""fabric""#, &format!("{base}/files/pack-5.mrpack"), "Pack-5.mrpack", b"zip");
+    let shader = card_version("s1", "r5", r#""26.3""#, r#""iris","optifine""#, &format!("{base}/files/s.zip"), "s.zip", b"zip");
+    h.mock.set(vec![
+        route("/search", 200, search_json(&[("AAA", "Thing")])),
+        route("/project/AAA/version", 200, format!("[{pack},{shader}]")),
+        route("/project/AAA", 200, project_json("AAA", "shader", &base)),
+        route("/img/", 200, png_bytes(32, 18, [1, 2, 3])),
+    ]);
+    h.click("Каталог");
+    h.wait("search", 10, |a| a.mod_searched);
+    for (tab, kind) in [("Ресурспаки", mods::ContentKind::ResourcePack), ("Шейдеры", mods::ContentKind::Shader), ("Моды", mods::ContentKind::Mod)] {
+        h.click(tab);
+        h.wait("search", 10, |a| a.mod_searched && a.content_kind == kind);
+        h.click("card:AAA");
+        h.wait("card loaded", 10, |a| a.project_view.as_ref().is_some_and(|v| v.project.is_some() && v.versions_job.is_none()));
+        assert_eq!(h.app.project_view.as_ref().unwrap().kind, project::ProjectKind::Content(kind));
+        for t in ["Версии", "Галерея", "Описание"] {
+            h.click(t);
+        }
+        h.click("Назад в каталог");
+    }
+
+    // modpacks: «Версии» opens the card on its versions; a chosen version installs from its own .mrpack
+    h.click("Модпаки");
+    h.wait("modpack search", 10, |a| a.pack_searched);
+    h.click("Версии");
+    assert_eq!(h.app.page, Page::Project);
+    let view = h.app.project_view.as_ref().unwrap();
+    assert_eq!((view.kind, view.tab), (project::ProjectKind::Modpack, project::TAB_VERSIONS));
+    h.wait("versions", 10, |a| a.project_view.as_ref().is_some_and(|v| v.versions_job.is_none()));
+    h.click_nth("Установить эту версию", 0);
+    h.wait("pack install finished", 20, |a| a.pack_install_job.is_none());
+    assert!(h.mock.requests().iter().any(|r| r.contains("/files/pack-5.mrpack")), "{:?}", h.mock.requests());
+}
+
+/// Pictures of the project card with real Modrinth data (needs the internet):
+/// `LIMECRAFT_SNAPSHOT_DIR=<dir> cargo test snapshots_of_project_cards -- --ignored`
+#[test]
+#[ignore]
+fn snapshots_of_project_cards() {
+    let _g = lock();
+    let mut h = H::new(vec![fabric_instance("26.3 fabric")]);
+    unsafe { std::env::remove_var("LIMECRAFT_MODRINTH_API") };
+    let loaded = |a: &LimeApp| a.project_view.as_ref().is_some_and(|v| v.project_job.is_none() && v.versions_job.is_none());
+    let settle = |h: &mut H, secs: u64| {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            h.frame(vec![]);
+        }
+    };
+    for (n, (kind_tab, slug)) in [("Моды", "sodium"), ("Шейдеры", "complementary-reimagined"), ("Ресурспаки", "fresh-animations")].iter().enumerate() {
+        h.click("Каталог");
+        h.click(kind_tab);
+        h.wait("search", 30, |a| a.mod_searched);
+        let mut hit = h.app.mod_results.first().cloned().expect("results");
+        if let Ok(p) = modrinth::get_project(&install::make_client(), slug) {
+            hit.project_id = p.id;
+            hit.title = p.title;
+            hit.icon_url = p.icon_url;
+            hit.slug = p.slug;
+            hit.description = p.description;
+        }
+        if n == 0 {
+            settle(&mut h, 3);
+            h.snapshot("0-catalog");
+        }
+        let kind = h.app.content_kind;
+        h.app.open_project(&hit, project::ProjectKind::Content(kind), project::TAB_ABOUT);
+        h.wait("card", 30, loaded);
+        settle(&mut h, 4);
+        h.snapshot(&format!("{n}-a-about"));
+        h.click("Версии");
+        settle(&mut h, 1);
+        h.snapshot(&format!("{n}-b-versions"));
+        h.click("Галерея");
+        settle(&mut h, 6);
+        h.snapshot(&format!("{n}-c-gallery"));
+        if h.has("gallery:0") {
+            h.click("gallery:0");
+            settle(&mut h, 6);
+            h.snapshot(&format!("{n}-d-lightbox"));
+            h.press(Key::Escape);
+        }
+        h.click("Назад в каталог");
+    }
+    h.click("Модпаки");
+    h.wait("packs", 30, |a| a.pack_searched);
+    h.click("Версии");
+    h.wait("card", 30, loaded);
+    settle(&mut h, 3);
+    h.snapshot("3-b-modpack-versions");
+    // the soft style
+    h.app.state.ui.style = prefs::UiStyle::Soft;
+    LimeApp::apply_prefs(&h.ctx, &h.app.state.ui);
+    h.click("Описание");
+    settle(&mut h, 2);
+    h.snapshot("3-a-modpack-about-soft");
 }

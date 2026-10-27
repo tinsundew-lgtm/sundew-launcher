@@ -5,6 +5,7 @@ mod app;
 mod assets;
 mod core;
 mod fx;
+mod markdown;
 mod theme;
 mod ui;
 #[cfg(test)]

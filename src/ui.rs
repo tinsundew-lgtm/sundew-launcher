@@ -83,6 +83,12 @@ icons! {
     Archive = '\u{E00C}', false;
     Shirt = '\u{E670}', false;
     Upload = '\u{E4C0}', false;
+    Forward = '\u{E06C}', false;
+    Heart = '\u{E2A8}', false;
+    Calendar = '\u{E108}', false;
+    CaretLeft = '\u{E138}', false;
+    CaretRight = '\u{E13A}', false;
+    External = '\u{E5DE}', false;
 }
 
 /// Draw `icon` centered in `rect`. The glyph is centered by its visible
@@ -439,8 +445,47 @@ pub fn pill_tabs_width(ui: &Ui, tabs: &[(Option<Icon>, &str)]) -> f32 {
 
 /// Tab bar: chunky keys (pixel style, the selection key slides from tab to tab)
 /// or a rounded pill (soft style). Returns true when the selection changed.
+///
+/// These are the tabs inside a page (sub-tabs): they sit in an accent-colored
+/// frame, so they never look like the main tabs at the top ([`main_tabs`]).
 pub fn pill_tabs(ui: &mut Ui, tabs: &[(Option<Icon>, &str)], selected: &mut usize) -> bool {
-    if theme::pixel() { pixel_tabs(ui, tabs, selected) } else { soft_tabs(ui, tabs, selected) }
+    if theme::pixel() {
+        let out = egui::Frame::new().inner_margin(egui::Margin::same(FRAME_PAD as i8)).show(ui, |ui| pixel_tabs(ui, tabs, selected));
+        ui.painter().extend(outline_shapes(out.response.rect, 4.0, theme::green(), 1.5));
+        out.inner
+    } else {
+        soft_tabs(ui, tabs, selected, true)
+    }
+}
+
+/// The main tabs of the window (no frame).
+pub fn main_tabs(ui: &mut Ui, tabs: &[(Option<Icon>, &str)], selected: &mut usize) -> bool {
+    if theme::pixel() { pixel_tabs(ui, tabs, selected) } else { soft_tabs(ui, tabs, selected, false) }
+}
+
+/// Space between a sub-tab bar and its frame, on each side.
+const FRAME_PAD: f32 = 5.0;
+
+/// Width of a sub-tab bar made by [`pill_tabs`], frame included.
+pub fn pill_tabs_framed_width(ui: &Ui, tabs: &[(Option<Icon>, &str)]) -> f32 {
+    pill_tabs_width(ui, tabs) + if theme::pixel() { 2.0 * FRAME_PAD } else { 0.0 }
+}
+
+/// Only the border of a notched box (the inside stays see-through).
+pub fn outline_shapes(rect: Rect, step: f32, color: Color32, width: f32) -> Vec<Shape> {
+    let s = step.min(rect.width() / 4.0).min(rect.height() / 4.0);
+    let r = |x0: f32, y0: f32, x1: f32, y1: f32| Shape::rect_filled(Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)), 0.0, color);
+    vec![
+        r(rect.left() + s, rect.top(), rect.right() - s, rect.top() + width),
+        r(rect.left() + s, rect.bottom() - width, rect.right() - s, rect.bottom()),
+        r(rect.left(), rect.top() + s, rect.left() + width, rect.bottom() - s),
+        r(rect.right() - width, rect.top() + s, rect.right(), rect.bottom() - s),
+        // the cut corners are closed by a short diagonal step
+        r(rect.left() + 1.0, rect.top() + 1.0, rect.left() + s, rect.top() + 1.0 + width),
+        r(rect.right() - s, rect.top() + 1.0, rect.right() - 1.0, rect.top() + 1.0 + width),
+        r(rect.left() + 1.0, rect.bottom() - 1.0 - width, rect.left() + s, rect.bottom() - 1.0),
+        r(rect.right() - s, rect.bottom() - 1.0 - width, rect.right() - 1.0, rect.bottom() - 1.0),
+    ]
 }
 
 fn pixel_tabs(ui: &mut Ui, tabs: &[(Option<Icon>, &str)], selected: &mut usize) -> bool {
@@ -496,11 +541,11 @@ fn pixel_tabs(ui: &mut Ui, tabs: &[(Option<Icon>, &str)], selected: &mut usize) 
     changed
 }
 
-fn soft_tabs(ui: &mut Ui, tabs: &[(Option<Icon>, &str)], selected: &mut usize) -> bool {
+fn soft_tabs(ui: &mut Ui, tabs: &[(Option<Icon>, &str)], selected: &mut usize, framed: bool) -> bool {
     let mut changed = false;
     egui::Frame::new()
         .fill(theme::card())
-        .stroke(Stroke::new(1.0, theme::divider()))
+        .stroke(if framed { Stroke::new(1.5, theme::green()) } else { Stroke::new(1.0, theme::divider()) })
         .corner_radius(CornerRadius::same(14))
         .inner_margin(egui::Margin::same(4))
         .show(ui, |ui| {
@@ -642,6 +687,21 @@ impl Card {
         ui.set_opacity(saved);
         out
     }
+}
+
+/// Small label on a tinted background (categories, loaders, release type).
+pub fn chip(ui: &mut Ui, text: &str, color: Color32) -> Response {
+    let font = FontId::new(12.0, if theme::pixel() { bold_family() } else { egui::FontFamily::Proportional });
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 14.0, 22.0), Sense::hover());
+    let fill = theme::mix(theme::card(), color, if theme::palette().dark { 0.16 } else { 0.12 });
+    if theme::pixel() {
+        paint_notched(ui.painter(), rect, 2.0, fill);
+    } else {
+        ui.painter().rect_filled(rect, CornerRadius::same(8), fill);
+    }
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, color);
+    resp
 }
 
 /// Card heading with an icon.

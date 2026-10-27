@@ -61,9 +61,13 @@ pub fn save_rgba_png(rgba: &[u8], w: u32, h: u32, dest: &Path) -> Result<(), Str
 
 /// Cache file of a remote icon (one ready thumbnail per URL).
 pub fn icon_cache_path(cache_dir: &Path, url: &str, size: u32) -> std::path::PathBuf {
+    cache_dir.join(format!("{}-{size}.png", url_key(url)))
+}
+
+/// Short file-name-safe key of a URL.
+fn url_key(url: &str) -> String {
     use sha1::{Digest, Sha1};
-    let key = hex::encode(Sha1::digest(url.as_bytes()));
-    cache_dir.join(format!("{}-{size}.png", &key[..24]))
+    hex::encode(Sha1::digest(url.as_bytes()))[..24].to_string()
 }
 
 /// Download a project icon once (mirrors are used when the CDN is blocked),
@@ -93,6 +97,50 @@ pub fn cached_icon(client: &reqwest::blocking::Client, url: &str, cache_dir: &Pa
     })();
     let _ = std::fs::remove_file(&tmp);
     result
+}
+
+/// Biggest remote picture (gallery, description) we download.
+const MAX_PICTURE_BYTES: u64 = 30 * 1024 * 1024;
+
+/// RGBA pixels of picture bytes, at most `max_side` px on the longer side (aspect kept).
+pub fn fitted_bytes(bytes: &[u8], max_side: u32) -> Result<(Vec<u8>, u32, u32), String> {
+    let img = image::load_from_memory(bytes).map_err(|e| format!("не удалось прочитать картинку: {e}"))?;
+    let img = if img.width().max(img.height()) > max_side { img.resize(max_side, max_side, image::imageops::FilterType::Triangle) } else { img };
+    let out = img.to_rgba8();
+    let (w, h) = out.dimensions();
+    Ok((out.into_raw(), w, h))
+}
+
+/// Download a remote picture once (gallery shots, pictures of a description), keep a
+/// copy no bigger than `max_side` px in `cache_dir` and return its pixels.
+/// The original file stays in the cache too, so other sizes need no new download.
+pub fn cached_picture(client: &reqwest::blocking::Client, url: &str, cache_dir: &Path, max_side: u32) -> Result<(Vec<u8>, u32, u32), String> {
+    let cached = icon_cache_path(cache_dir, url, max_side);
+    if cached.exists() {
+        if let Ok(px) = load_rgba(&cached) {
+            return Ok(px);
+        }
+    }
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(format!("неподдерживаемая ссылка на картинку: {url}"));
+    }
+    std::fs::create_dir_all(cache_dir).map_err(|e| e.to_string())?;
+    let original = cache_dir.join(format!("{}.src", url_key(url)));
+    if !original.exists() {
+        let tmp = original.with_extension("download");
+        super::download::download_file_ex(client, url, &tmp, None, None, None)?;
+        if std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0) > MAX_PICTURE_BYTES {
+            let _ = std::fs::remove_file(&tmp);
+            return Err("картинка слишком большая".to_string());
+        }
+        std::fs::rename(&tmp, &original).map_err(|e| e.to_string())?;
+    }
+    let bytes = std::fs::read(&original).map_err(|e| e.to_string())?;
+    let (rgba, w, h) = fitted_bytes(&bytes, max_side).inspect_err(|_| {
+        let _ = std::fs::remove_file(&original);
+    })?;
+    let _ = save_rgba_png(&rgba, w, h, &cached);
+    Ok((rgba, w, h))
 }
 
 /// Average brightness (0..=1) of RGBA pixels; transparent ones count as black.
@@ -171,6 +219,28 @@ mod tests {
         // a broken file is an error, not a panic
         m.set(vec![route("/bad.png", 200, "nope")]);
         assert!(cached_icon(&c, &format!("{}/bad.png", m.url()), &d, 64).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn remote_pictures_keep_their_shape_and_are_downloaded_once() {
+        use crate::testsupport::{Mock, route};
+        let d = tmp("picture");
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(400, 200, image::Rgba([10, 20, 30, 255])))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let m = Mock::start();
+        m.set(vec![route("/shot.png", 200, png)]);
+        let c = reqwest::blocking::Client::new();
+        let url = format!("{}/shot.png", m.url());
+        let (_, w, h) = cached_picture(&c, &url, &d, 100).unwrap();
+        assert_eq!((w, h), (100, 50), "aspect ratio is kept");
+        let (_, w, h) = cached_picture(&c, &url, &d, 1000).unwrap();
+        assert_eq!((w, h), (400, 200), "small pictures are not blown up");
+        assert_eq!(m.requests().len(), 1, "a second size comes from the saved original");
+        m.set(vec![route("/bad.png", 200, "nope")]);
+        assert!(cached_picture(&c, &format!("{}/bad.png", m.url()), &d, 100).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 
