@@ -1,0 +1,3 @@
+# Скрипты для Linux всегда с LF, иначе /bin/sh не запустит их
+*.sh text eol=lf
+*.desktop text eol=lf
