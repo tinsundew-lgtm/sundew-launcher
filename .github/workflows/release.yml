@@ -115,12 +115,15 @@ jobs:
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; if ($LASTEXITCODE -ne 0) { exit 1 } }
-          & $iscc /Q "/DAppVersion=$version" "/DSourceExe=$PWD\target\release\limecraft-launcher.exe" packaging\windows\limecraft.iss
+          $env:LIMECRAFT_INSTALLER_PAYLOAD = "$PWD\target\release\limecraft-launcher.exe"
+          cargo test --release --locked --manifest-path packaging/native-installer/Cargo.toml --target-dir target
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cargo build --release --locked --manifest-path packaging/native-installer/Cargo.toml --target-dir target
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $setup = "LimeCraft-$version-setup-x64.exe"
-          Move-Item "dist/$setup" $setup
+          Copy-Item "target/release/limecraft-setup.exe" $setup
+          Copy-Item "target/release/limecraft-launcher.exe" "LimeCraft-launcher-windows-x64.exe"
+          (Get-FileHash "LimeCraft-launcher-windows-x64.exe" -Algorithm SHA256).Hash.ToLower() + "  LimeCraft-launcher-windows-x64.exe" | Out-File -Encoding ascii "LimeCraft-launcher-windows-x64.exe.sha256"
           (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower() + "  $setup" | Out-File -Encoding ascii "$setup.sha256"
           "SETUP=$setup" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
 
@@ -130,6 +133,8 @@ jobs:
           path: |
             ${{ env.SETUP }}
             ${{ env.SETUP }}.sha256
+            LimeCraft-launcher-windows-x64.exe
+            LimeCraft-launcher-windows-x64.exe.sha256
             ${{ env.ARCHIVE }}
             ${{ env.ARCHIVE }}.sha256
 
@@ -140,5 +145,7 @@ jobs:
           files: |
             ${{ env.SETUP }}
             ${{ env.SETUP }}.sha256
+            LimeCraft-launcher-windows-x64.exe
+            LimeCraft-launcher-windows-x64.exe.sha256
             ${{ env.ARCHIVE }}
             ${{ env.ARCHIVE }}.sha256

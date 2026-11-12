@@ -181,7 +181,8 @@ pub struct LimeApp {
     capsules: capsules::CapsuleUi,
     skin_loader: skin_loader::SkinLoaderUi,
     session: session::SessionUi,
-    party: party::PartyUi,
+    screenshots: screenshots::ScreenshotsUi,
+    updater: updater::UpdaterUi,
     state: LauncherState,
     page: Page,
     assets: Assets,
@@ -382,7 +383,8 @@ impl LimeApp {
             capsules: Default::default(),
             skin_loader: Default::default(),
             session: Default::default(),
-            party: Default::default(),
+            screenshots: Default::default(),
+            updater: Default::default(),
             state: state.clone(),
             // debug aid for screenshots: LIMECRAFT_PAGE=instance|mods|installed|settings
             page: match std::env::var("LIMECRAFT_PAGE").as_deref() {
@@ -510,7 +512,7 @@ impl LimeApp {
     }
 
     fn is_busy(&self) -> bool {
-        self.party.busy() || self.skin_loader.busy() || self.capsules.busy() || self.versions_job.is_some()
+        self.updater.busy() || self.screenshots.busy() || self.skin_loader.busy() || self.capsules.busy() || self.versions_job.is_some()
             || self.packs.busy()
             || self.tags.busy()
             || self.cart.job.is_some()
@@ -608,7 +610,8 @@ impl LimeApp {
         self.poll_jobs();
         self.poll_capsules();
         self.poll_skin_loader();
-        self.poll_party();
+        self.poll_screenshots();
+        self.poll_updater();
         if self.capsules.busy() { ui.disable(); }
         self.restore_after_game();
         if self.state.ui.theme == prefs::ThemeMode::System {
@@ -657,6 +660,7 @@ impl LimeApp {
                     self.install_progress_bar(ui, &prog, Some(&prog.cancelled));
                 });
         }
+        self.draw_update_banner(ui);
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(page_fill).inner_margin(egui::Margin::symmetric(26, 6)))
             .show(ui, |ui| {
@@ -1262,7 +1266,6 @@ impl LimeApp {
 
     /// Главная вкладка «Сборки»: «Продолжить» + библиотека карточек.
     fn draw_home(&mut self, ui: &mut egui::Ui) {
-        self.draw_time_picker(ui);
         ui.add_space(16.0);
 
         if self.state.instances.is_empty() {
@@ -1769,7 +1772,7 @@ impl LimeApp {
         ui.separator();
         ui.add_space(8.0);
 
-        let tabs = [(Some(Icon::Cube), "Содержимое"), (Some(Icon::Terminal), "Журнал"), (Some(Icon::Sliders), "Настройки"), (Some(Icon::Cube), "Капсулы"), (Some(Icon::Info), "Сессия"), (Some(Icon::Link), "Друзья")];
+        let tabs = [(Some(Icon::Cube), "Содержимое"), (Some(Icon::Terminal), "Журнал"), (Some(Icon::Sliders), "Настройки"), (Some(Icon::Cube), "Капсулы"), (Some(Icon::Info), "Сессия"), (Some(Icon::Image), "Скриншоты")];
         if ui::pill_tabs(ui, &tabs, &mut self.inst_tab) {
             self.log_for = None;
         }
@@ -1801,7 +1804,7 @@ impl LimeApp {
             2 => self.draw_instance_settings_tab(ui, &inst),
             3 => self.draw_capsules(ui, &inst),
             4 => self.draw_session_notes(ui, &inst),
-            _ => self.draw_party(ui, &inst),
+            _ => self.draw_screenshots(ui, &inst),
         }
     }
 }
@@ -3387,6 +3390,8 @@ impl LimeApp {
 impl LimeApp {
     /// Вкладка «Другое» (ресурспаки, шейдеры, глобальные настройки).
     fn draw_other(&mut self, ui: &mut egui::Ui) {
+        self.draw_update_panel(ui);
+        ui.separator();
         ui.add_space(14.0);
         ui::heading(ui, "Настройки");
         ui.label(RichText::new("Профили, оформление, запуск игры, Java и память.").color(theme::muted()).size(13.0));
@@ -4100,7 +4105,8 @@ mod cart;
 mod capsules;
 mod skin_loader;
 mod session;
-mod party;
+mod screenshots;
+mod updater;
 mod catalog;
 mod deps;
 mod project;

@@ -58,9 +58,24 @@ pub fn install(dir:&Path,payload:&[u8],expected:&str,progress:&AtomicUsize)->Res
     for name in ["previous.exe","previous.json"] {let _=fs::remove_file(stage.join(name));}
     let _=fs::remove_dir(&stage); progress.store(100,Ordering::Relaxed); Ok(target)
 }
+pub fn validate_data_pointer(app:&Path,data:&Path)->Result<(),String>{
+    if !data.is_absolute() || data.parent().is_none(){return Err("Укажите абсолютный путь к папке данных".into());}
+    safe(data)?;safe(&app.join(crate::data_location::POINTER))?;
+    if data.exists() && !data.is_dir(){return Err("Путь данных не является папкой".into());}
+    // Existing pointer must be valid; never silently replace arbitrary content.
+    crate::data_location::read_pointer(app)?;Ok(())
+}
+pub fn save_data_pointer(app:&Path,data:&Path)->Result<(),String>{
+    validate_data_pointer(app,data)?;
+    let path=app.join(crate::data_location::POINTER);let tmp=app.join(".limecraft-data.tmp");
+    let bytes=serde_json::to_vec_pretty(&serde_json::json!({"data_dir":data})).map_err(error)?;
+    new_file(&tmp,&bytes)?;
+    fs::rename(&tmp,&path).map_err(error)
+}
 #[cfg(test)] mod tests {
     use super::*;
     fn dir()->PathBuf {std::env::temp_dir().join(format!("lime-setup-test-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()))}
     #[test] fn install_update_and_protect_unknown_files(){let d=dir();let p=b"MZtest";let n=AtomicUsize::new(0);install(&d,p,&hash(p),&n).unwrap();fs::write(d.join("keep.txt"),b"user").unwrap();let p2=b"MZnew";install(&d,p2,&hash(p2),&n).unwrap();assert_eq!(fs::read(d.join(EXE)).unwrap(),p2);assert!(d.join("keep.txt").exists());fs::write(d.join(EXE),b"changed").unwrap();assert!(install(&d,p,&hash(p),&n).is_err());assert_eq!(fs::read(d.join(EXE)).unwrap(),b"changed");fs::remove_dir_all(d).unwrap();}
+    #[test] fn data_pointer_preserves_existing_files(){let app=dir();let data=dir();fs::create_dir_all(&app).unwrap();fs::create_dir_all(data.join("instances/test")).unwrap();fs::write(data.join("launcher_state.json"),b"existing").unwrap();save_data_pointer(&app,&data).unwrap();save_data_pointer(&app,&data).unwrap();assert_eq!(crate::data_location::read_pointer(&app).unwrap(),Some(data.clone()));assert_eq!(fs::read(data.join("launcher_state.json")).unwrap(),b"existing");assert!(data.join("instances/test").exists());fs::remove_dir_all(app).unwrap();fs::remove_dir_all(data).unwrap();}
     #[test] fn rejects_bad_payload(){let d=dir();assert!(install(&d,b"MZ", "bad",&AtomicUsize::new(0)).is_err());assert!(!d.exists());}
 }

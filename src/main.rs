@@ -4,6 +4,7 @@
 mod app;
 mod assets;
 mod core;
+mod data_location;
 mod fx;
 mod markdown;
 mod theme;
@@ -30,6 +31,13 @@ fn load_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result<()> {
+    if std::env::args().any(|a|a=="--limecraft-apply-update") {
+        if let Err(e)=core::self_update::apply_helper(){
+            if let Ok(exe)=std::env::current_exe(){if let Some(dir)=exe.parent(){let _=std::fs::write(dir.join("update-error.txt"),e);}}
+        }
+        return Ok(());
+    }
+    core::self_update::cleanup_completed();
     // Panic log goes to the launcher's data dir (never a compile-time path).
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("PANIC: {info}\n{:?}", std::backtrace::Backtrace::force_capture());

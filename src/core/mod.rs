@@ -1,7 +1,7 @@
 pub mod account;
 pub mod capsules;
 pub mod session;
-pub mod party;
+pub mod self_update;
 pub mod diagnostics;
 pub mod download;
 pub mod images;

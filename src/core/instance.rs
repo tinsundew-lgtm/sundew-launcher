@@ -162,6 +162,15 @@ pub fn resolve_root() -> Result<PathBuf, String> {
     if let Some(r) = ROOT.get() {
         return Ok(r.clone());
     }
+    // An installer-selected data root is explicit: never silently switch to an empty folder.
+    let explicit = std::env::var_os("LIMECRAFT_HOME").filter(|p|!p.is_empty()).map(PathBuf::from)
+        .or(match std::env::current_exe().ok().and_then(|p|p.parent().map(Path::to_path_buf)) {
+            Some(dir)=>crate::data_location::read_pointer(&dir)?,None=>None,
+        });
+    if let Some(dir)=explicit {
+        if !dir_writable(&dir){return Err(format!("Выбранная папка данных недоступна для записи: {}",dir.display()));}
+        let _=ROOT.set(dir.clone());return Ok(dir);
+    }
     let mut cands = vec![preferred_dir()];
     if let Some(exe_dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
         cands.push(exe_dir.join("LimeCraft-data"));
