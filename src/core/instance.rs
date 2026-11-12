@@ -45,6 +45,9 @@ pub struct Instance {
     /// Свой ник для этой сборки (`None` = активный профиль).
     #[serde(default)]
     pub username: Option<String>,
+    /// User-owned session journal and recommendation preferences.
+    #[serde(default)]
+    pub session: super::session::SessionNotes,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]

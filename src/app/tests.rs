@@ -1682,6 +1682,23 @@ fn the_cart_checks_compatibility_and_installs_what_fits() {
     assert!(h.app.cart.items.is_empty());
 }
 
+#[test]
+fn install_progress_is_visible_on_every_page() {
+    let _g=lock();let mut h=H::new(vec![fabric_instance("progress")]);
+    h.app.mod_install_prog=Some(Arc::new(install::InstallProgress::new()));
+    for page in [Page::Home,Page::Mods,Page::Skins,Page::Other,Page::Instance] {
+        h.app.page=page;h.frame(vec![]);assert!(h.has("Глобальный прогресс установки"),"{page:?}");
+    }
+}
+
+#[test]
+fn installed_mod_switch_renames_file() {
+    let _g=lock();let inst=fabric_instance("switch");let mut h=H::new(vec![inst.clone()]);
+    let dir=instance::instance_mines(&h.root,&inst.name).join("mods");std::fs::create_dir_all(&dir).unwrap();std::fs::write(dir.join("switch.jar"),b"jar").unwrap();
+    h.app.installed_items=mods::scan(&h.root,&inst.name,mods::ContentKind::Mod).unwrap();h.app.installed_for=Some((inst.name.clone(),mods::ContentKind::Mod));h.app.page=Page::Instance;h.app.inst_tab=0;
+    h.frame(vec![]);h.click("Активность: switch.jar");assert!(dir.join("switch.jar.disabled").is_file());assert!(!dir.join("switch.jar").exists());
+}
+
 /// Pictures of the 1.0.3 card features with real Modrinth data (needs the internet):
 /// `LIMECRAFT_SNAPSHOT_DIR=<dir> cargo test snapshots_of_card_plus -- --ignored`
 #[test]

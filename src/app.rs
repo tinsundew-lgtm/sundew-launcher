@@ -178,6 +178,10 @@ fn paint_skin_head(ui: &egui::Ui, rect: egui::Rect, tex: &egui::TextureHandle) {
 
 pub struct LimeApp {
     root: PathBuf,
+    capsules: capsules::CapsuleUi,
+    skin_loader: skin_loader::SkinLoaderUi,
+    session: session::SessionUi,
+    party: party::PartyUi,
     state: LauncherState,
     page: Page,
     assets: Assets,
@@ -375,6 +379,10 @@ impl LimeApp {
             .unwrap_or_else(|| "latest".to_string());
         let mut app = Self {
             root,
+            capsules: Default::default(),
+            skin_loader: Default::default(),
+            session: Default::default(),
+            party: Default::default(),
             state: state.clone(),
             // debug aid for screenshots: LIMECRAFT_PAGE=instance|mods|installed|settings
             page: match std::env::var("LIMECRAFT_PAGE").as_deref() {
@@ -502,7 +510,7 @@ impl LimeApp {
     }
 
     fn is_busy(&self) -> bool {
-        self.versions_job.is_some()
+        self.party.busy() || self.skin_loader.busy() || self.capsules.busy() || self.versions_job.is_some()
             || self.packs.busy()
             || self.tags.busy()
             || self.cart.job.is_some()
@@ -598,6 +606,10 @@ impl LimeApp {
         }
 
         self.poll_jobs();
+        self.poll_capsules();
+        self.poll_skin_loader();
+        self.poll_party();
+        if self.capsules.busy() { ui.disable(); }
         self.restore_after_game();
         if self.state.ui.theme == prefs::ThemeMode::System {
             let dark = ui.ctx().system_theme().map(|t| t == egui::Theme::Dark).unwrap_or(true);
@@ -635,6 +647,16 @@ impl LimeApp {
             .show_separator_line(false)
             .frame(egui::Frame::new().fill(bar_fill).inner_margin(egui::Margin::symmetric(16, 0)))
             .show(ui, |ui| self.draw_nav_bar(ui));
+        if let Some(prog) = self.mod_install_prog.clone().or_else(|| self.pack_install_prog.clone()).or_else(|| self.skin_loader.progress()) {
+            egui::Panel::bottom("global_install_progress")
+                .resizable(false)
+                .frame(egui::Frame::new().fill(theme::card()).inner_margin(egui::Margin::symmetric(20, 10)))
+                .show(ui, |ui| {
+                    let heading=ui.label(RichText::new("Установка / обновление содержимого").strong());
+                    ui::reg("Глобальный прогресс установки",heading.rect);
+                    self.install_progress_bar(ui, &prog, Some(&prog.cancelled));
+                });
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(page_fill).inner_margin(egui::Margin::symmetric(26, 6)))
             .show(ui, |ui| {
@@ -1240,6 +1262,7 @@ impl LimeApp {
 
     /// Главная вкладка «Сборки»: «Продолжить» + библиотека карточек.
     fn draw_home(&mut self, ui: &mut egui::Ui) {
+        self.draw_time_picker(ui);
         ui.add_space(16.0);
 
         if self.state.instances.is_empty() {
@@ -1622,7 +1645,8 @@ impl LimeApp {
             self.toast = Some("Выберите сборку".to_string());
             return;
         };
-        if self.launch_job.is_some() {
+        if self.is_busy() {
+            self.toast = Some("Дождитесь завершения фоновых операций".into());
             return;
         }
         if launch::is_running(&inst.name) {
@@ -1644,6 +1668,7 @@ impl LimeApp {
         let window_args = self.state.ui.window.game_args();
         self.launching = Some(inst.name.clone());
         let root = self.root.clone();
+        let auto_capsule = self.capsules.automatic();
         let job: Job<String> = Arc::new(Mutex::new(None));
         let slot = job.clone();
         let prog = Arc::new(install::InstallProgress::new());
@@ -1651,6 +1676,9 @@ impl LimeApp {
         self.launch_prog = Some(prog);
         std::thread::spawn(move || {
             let result = catch_job(|| {
+                if auto_capsule {
+                    crate::core::capsules::create(&root, &inst, "Перед запуском", false)?;
+                }
                 // No suitable Java anywhere? Fetch one (unless the user set a path).
                 let custom = inst.java_path.as_deref().filter(|s| !s.trim().is_empty()).or(java_custom.as_deref());
                 if custom.is_none() {
@@ -1741,7 +1769,7 @@ impl LimeApp {
         ui.separator();
         ui.add_space(8.0);
 
-        let tabs = [(Some(Icon::Cube), "Содержимое"), (Some(Icon::Terminal), "Журнал"), (Some(Icon::Sliders), "Настройки")];
+        let tabs = [(Some(Icon::Cube), "Содержимое"), (Some(Icon::Terminal), "Журнал"), (Some(Icon::Sliders), "Настройки"), (Some(Icon::Cube), "Капсулы"), (Some(Icon::Info), "Сессия"), (Some(Icon::Link), "Друзья")];
         if ui::pill_tabs(ui, &tabs, &mut self.inst_tab) {
             self.log_for = None;
         }
@@ -1770,7 +1798,10 @@ impl LimeApp {
                 self.draw_installed(ui);
             }
             1 => self.draw_instance_log(ui, &inst),
-            _ => self.draw_instance_settings_tab(ui, &inst),
+            2 => self.draw_instance_settings_tab(ui, &inst),
+            3 => self.draw_capsules(ui, &inst),
+            4 => self.draw_session_notes(ui, &inst),
+            _ => self.draw_party(ui, &inst),
         }
     }
 }
@@ -2686,6 +2717,7 @@ impl LimeApp {
             ui.add_space(8.0);
         }
         self.draw_skin_loader_note(ui);
+        self.draw_skin_loader_install(ui);
         ui.add_space(12.0);
 
         let shown = self.skin_preview.clone().or(active.skin.clone());
@@ -3312,7 +3344,7 @@ impl LimeApp {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     let mut en = item.enabled;
-                    if ui.checkbox(&mut en, "").on_hover_text("Включён / выключен").changed() {
+                    if ui::toggle(ui, &mut en, &format!("Активность: {}", item.file_name)).changed() {
                         self.toggle_item(idx, en);
                     }
                     let tile_name = item.title.clone().unwrap_or_else(|| item.file_name.clone());
@@ -4065,6 +4097,10 @@ impl LimeApp {
 }
 
 mod cart;
+mod capsules;
+mod skin_loader;
+mod session;
+mod party;
 mod catalog;
 mod deps;
 mod project;

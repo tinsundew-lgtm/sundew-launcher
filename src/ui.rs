@@ -18,6 +18,21 @@ pub fn reg(label: &str, rect: Rect) {
     let _ = (label, rect);
 }
 
+/// Accessible animated on/off switch (keyboard activation follows egui buttons).
+pub fn toggle(ui: &mut Ui, value: &mut bool, label: &str) -> Response {
+    let (rect, mut response) = ui.allocate_exact_size(egui::vec2(44.0, 24.0), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, ui.is_enabled(), *value, label));
+    if response.clicked() { *value = !*value; response.mark_changed(); }
+    let t = ui.ctx().animate_bool(response.id, *value);
+    let fill = if *value { theme::green() } else { theme::button() };
+    ui.painter().rect_filled(rect.shrink(1.0), 12.0, fill);
+    ui.painter().rect_stroke(rect.shrink(1.0), 12.0, Stroke::new(1.0, theme::divider()), StrokeKind::Inside);
+    let center = egui::pos2(rect.left() + 12.0 + t * 20.0, rect.center().y);
+    ui.painter().circle_filled(center, 8.0, if *value { theme::accent_fg() } else { theme::text() });
+    reg(label, rect);
+    response.on_hover_text(if *value { "Включён — нажмите, чтобы отключить" } else { "Выключен — нажмите, чтобы включить" })
+}
+
 /// Font families of the icon set (Phosphor, MIT; see `assets/fonts`).
 pub const ICON_FONT: &str = "phosphor";
 pub const ICON_FONT_FILL: &str = "phosphor-fill";

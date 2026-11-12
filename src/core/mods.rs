@@ -357,6 +357,10 @@ pub fn install(
     let plan = plan_install(client, inst, kind, version, &installed_projects)?;
     let mut report = InstallReport { installed: Vec::new(), warnings: plan.warnings };
 
+    if let Some(p)=prog {
+        p.total.store((plan.dependencies.len()+1) as u64,std::sync::atomic::Ordering::Relaxed);
+        p.current.store(0,std::sync::atomic::Ordering::Relaxed);
+    }
     for v in std::iter::once(version).chain(plan.dependencies.iter()) {
         if let Some(p) = prog {
             if p.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -365,6 +369,7 @@ pub fn install(
         }
         let dest = download_version(client, &dir, v, prog)?;
         report.installed.push(dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+        if let Some(p)=prog {p.current.fetch_add(1,std::sync::atomic::Ordering::Relaxed);}
     }
     Ok(report)
 }

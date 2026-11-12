@@ -1,4 +1,8 @@
 pub mod account;
+pub mod capsules;
+pub mod session;
+pub mod party;
+pub mod diagnostics;
 pub mod download;
 pub mod images;
 pub mod import;
